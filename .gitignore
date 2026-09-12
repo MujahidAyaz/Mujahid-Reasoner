@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Model checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Large datasets
+data/raw/*
+data/interim/*
+data/processed/*
+
+# Experiment outputs
+experiments/runs/
+wandb/
+mlruns/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

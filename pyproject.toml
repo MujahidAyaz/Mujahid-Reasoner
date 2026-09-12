@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mujahid-reasoner"
+version = "0.1.0"
+description = "A from-scratch modern decoder-only LLM for reasoning, mathematics, coding, and technical problem solving."
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+
+dependencies = [
+    "torch>=2.13",
+    "transformers>=5.0",
+    "datasets>=5.0",
+    "tokenizers>=0.23",
+    "accelerate>=1.0",
+    "safetensors>=0.8",
+    "tqdm>=4.0",
+    "numpy>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

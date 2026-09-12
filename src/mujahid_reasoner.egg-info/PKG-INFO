@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: mujahid-reasoner
+Version: 0.1.0
+Summary: A from-scratch modern decoder-only LLM for reasoning, mathematics, coding, and technical problem solving.
+License-Expression: MIT
+Requires-Python: >=3.14
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.13
+Requires-Dist: transformers>=5.0
+Requires-Dist: datasets>=5.0
+Requires-Dist: tokenizers>=0.23
+Requires-Dist: accelerate>=1.0
+Requires-Dist: safetensors>=0.8
+Requires-Dist: tqdm>=4.0
+Requires-Dist: numpy>=2.0
+Dynamic: license-file
