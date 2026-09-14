@@ -2,6 +2,12 @@ LICENSE
 README.md
 pyproject.toml
 src/data/__init__.py
+src/data/cleaner.py
+src/data/deduplicator.py
+src/data/filters.py
+src/data/loader.py
+src/data/splitter.py
+src/data/statistics.py
 src/evaluation/__init__.py
 src/inference/__init__.py
 src/model/__init__.py

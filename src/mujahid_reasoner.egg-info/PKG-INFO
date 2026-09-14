@@ -14,4 +14,5 @@ Requires-Dist: accelerate>=1.0
 Requires-Dist: safetensors>=0.8
 Requires-Dist: tqdm>=4.0
 Requires-Dist: numpy>=2.0
+Requires-Dist: pyyaml>=6.0
 Dynamic: license-file

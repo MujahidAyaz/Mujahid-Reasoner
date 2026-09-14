@@ -1,0 +1,22 @@
+dataset:
+  name: "HuggingFaceFW/fineweb-edu"
+  config: "sample-10BT"
+  split: "train"
+  streaming: true
+
+output:
+  raw_dir: "data/raw"
+  interim_dir: "data/interim"
+  processed_dir: "data/processed"
+
+processing:
+  max_documents: 10000
+  min_characters: 200
+  max_characters: 100000
+  validation_ratio: 0.01
+  seed: 42
+
+quality:
+  remove_null_bytes: true
+  normalize_whitespace: true
+  remove_empty_documents: true
