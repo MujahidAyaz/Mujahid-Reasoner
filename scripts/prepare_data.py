@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import yaml
 
@@ -11,9 +17,8 @@ from src.data.filters import DocumentFilter, FilterConfig
 from src.data.loader import DatasetConfig, DatasetLoader
 from src.data.splitter import DatasetSplitter, SplitConfig
 from src.data.statistics import DatasetStatistics
+from src.data.quality import QualityConfig, TextQualityAnalyzer
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "data.yaml"
 
 
@@ -61,6 +66,15 @@ def main() -> None:
         normalize_whitespace=config["quality"]["normalize_whitespace"],
     )
     document_filter = DocumentFilter(filter_config)
+    quality_analyzer = TextQualityAnalyzer(
+        QualityConfig(
+            max_replacement_character_ratio=0.005,
+            max_suspicious_encoding_ratio=0.01,
+            max_repeated_character_ratio=0.05,
+            
+            max_symbol_ratio=0.30,
+        )
+    )
     deduplicator = ExactDeduplicator()
     splitter = DatasetSplitter(split_config)
     statistics = DatasetStatistics()
@@ -78,8 +92,16 @@ def main() -> None:
 
         text = cleaner.clean(example.get("text", ""))
 
-        if not document_filter.is_valid(text):
-            statistics.record_rejected()
+        filter_result = document_filter.evaluate(text)
+
+        if not filter_result.is_valid:
+            statistics.record_rejected(filter_result.reason)
+            continue
+
+        quality_result = quality_analyzer.evaluate(text)
+
+        if not quality_result.is_valid:
+            statistics.record_rejected(quality_result.reason)
             continue
 
         if deduplicator.is_duplicate(text):
@@ -108,6 +130,35 @@ def main() -> None:
         validation_documents,
         processed_dir / "validation.jsonl",
     )
+
+    manifest = {
+        "dataset": {
+            "name": dataset_config.name,
+            "config": dataset_config.config,
+            "split": dataset_config.split,
+            "streaming": dataset_config.streaming,
+        },
+        "processing": {
+            "max_documents": max_documents,
+            "validation_ratio": split_config.validation_ratio,
+            "seed": split_config.seed,
+        },
+        "statistics": statistics.summary(),
+        "output": {
+            "train_documents": len(train_documents),
+            "validation_documents": len(validation_documents),
+        },
+    }
+
+    manifest_path = processed_dir / "dataset_manifest.json"
+
+    with manifest_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            manifest,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
 
     print("\nData preparation complete.")
     print("-" * 50)

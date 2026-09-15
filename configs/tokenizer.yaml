@@ -1,0 +1,20 @@
+tokenizer:
+  type: "byte_level_bpe"
+  vocab_size: 32000
+  min_frequency: 2
+
+special_tokens:
+  - "<pad>"
+  - "<bos>"
+  - "<eos>"
+  - "<unk>"
+
+data:
+  train_file: "data/processed/train.jsonl"
+
+output:
+  directory: "tokenizer"
+  tokenizer_file: "tokenizer.json"
+
+training:
+  limit_documents: null

@@ -19,4 +19,11 @@ processing:
 quality:
   remove_null_bytes: true
   normalize_whitespace: true
-  remove_empty_documents: true
+
+  max_url_ratio: 0.02
+  max_email_count: 3
+  max_repeated_line_ratio: 0.30
+  max_non_printable_ratio: 0.02
+
+  min_alpha_ratio: 0.20
+  min_word_count: 40
