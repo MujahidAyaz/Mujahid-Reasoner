@@ -1,0 +1,50 @@
+data:
+  train_file: "data/processed/tokens/train.bin"
+  validation_file: "data/processed/tokens/validation.bin"
+
+tokenizer:
+  path: "tokenizer/tokenizer.json"
+
+sequence:
+  length: 512
+
+dataloader:
+  batch_size: 2
+  shuffle: true
+  num_workers: 0
+  pin_memory: false
+  drop_last: false
+
+training:
+  device: "cpu"
+
+  max_epochs: 1
+  max_steps: 1000
+
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+  learning_rate: 0.0003
+  weight_decay: 0.1
+
+  beta1: 0.9
+  beta2: 0.95
+  optimizer_eps: 0.00000001
+
+  warmup_steps: 100
+  min_lr_ratio: 0.1
+
+  log_every_steps: 10
+  eval_every_steps: 100
+  checkpoint_every_steps: 100
+
+  max_eval_batches: 20
+
+  seed: 42
+
+output:
+  directory: "experiments/runs/mujahid-reasoner"
+
+checkpoint:
+  resume: false
+  filename: "latest.pt"

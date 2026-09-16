@@ -1,0 +1,37 @@
+model:
+  name: "mujahid-reasoner"
+
+  # Tokenizer vocabulary
+  vocab_size: 32000
+
+  # Transformer dimensions
+  hidden_size: 256
+  num_layers: 6
+
+  # Attention
+  num_attention_heads: 8
+  num_key_value_heads: 4
+
+  # Feed-forward network
+  intermediate_size: 768
+
+  # Context
+  max_sequence_length: 512
+
+  # Regularization
+  dropout: 0.0
+
+  # Rotary Position Embeddings
+  rope_theta: 10000.0
+
+  # Architecture
+  norm_type: "rmsnorm"
+  activation: "swiglu"
+  position_embedding: "rope"
+  attention_type: "gqa"
+
+  # Weight tying
+  tie_word_embeddings: true
+
+initialization:
+  initializer_range: 0.02
