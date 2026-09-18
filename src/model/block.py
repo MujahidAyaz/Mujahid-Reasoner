@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import torch
 from torch import Tensor, nn
 
 from src.model.attention import GroupedQueryAttention
+from src.model.cache import KVCache
 from src.model.config import ModelConfig
 from src.model.mlp import SwiGLU
 from src.model.norm import RMSNorm
@@ -11,37 +11,32 @@ from src.model.norm import RMSNorm
 
 class TransformerBlock(nn.Module):
     """
-    Pre-Norm Transformer block.
+    Pre-Norm Transformer block with optional KV caching.
 
     Architecture:
 
         x
         │
-        ├──────────────────────────────┐
-        │                              │
-        ▼                              │
-      RMSNorm                          │
-        │                              │
-        ▼                              │
-    GQA Attention                      │
-        │                              │
-        └───────────────► Residual Add ◄┘
-                              │
-                              ▼
-                            RMSNorm
-                              │
-                              ▼
-                            SwiGLU
-                              │
-        ┌─────────────────────┘
+        ├── RMSNorm
         │
-        └───────────────► Residual Add
+        ├── GQA + RoPE + optional KV cache
+        │
+        └── residual
+                │
+                ├── RMSNorm
+                │
+                ├── SwiGLU
+                │
+                └── residual
 
-    Input:
-        [batch, sequence_length, hidden_size]
+    Normal forward:
+        Input  -> [batch, sequence_length, hidden_size]
+        Output -> [batch, sequence_length, hidden_size]
 
-    Output:
-        [batch, sequence_length, hidden_size]
+    Cached forward:
+        Input  -> new tokens only
+        Cache  -> previous key/value states
+        Output -> new tokens only
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -69,7 +64,9 @@ class TransformerBlock(nn.Module):
         self,
         x: Tensor,
         position_offset: int = 0,
-    ) -> Tensor:
+        cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, KVCache | None]:
         """
         Apply one Pre-Norm Transformer block.
 
@@ -81,9 +78,20 @@ class TransformerBlock(nn.Module):
             position_offset:
                 Starting position for RoPE.
 
+            cache:
+                Optional KV cache from the previous forward pass.
+
+            use_cache:
+                Whether to return an updated KV cache.
+
         Returns:
-            Tensor with shape
-            [batch, sequence_length, hidden_size].
+            A tuple containing:
+
+            output:
+                [batch, sequence_length, hidden_size]
+
+            updated_cache:
+                Updated KV cache, or None when caching is disabled.
         """
 
         if x.ndim != 3:
@@ -106,12 +114,14 @@ class TransformerBlock(nn.Module):
 
         x = self.input_layernorm(x)
 
-        x = self.self_attn(
+        attention_output, updated_cache = self.self_attn(
             x,
             position_offset=position_offset,
+            cache=cache,
+            use_cache=use_cache,
         )
 
-        x = residual + x
+        x = residual + attention_output
 
         # ------------------------------------------------------------
         # Feed-forward sub-layer
@@ -125,4 +135,4 @@ class TransformerBlock(nn.Module):
 
         x = residual + x
 
-        return x
+        return x, updated_cache

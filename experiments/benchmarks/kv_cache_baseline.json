@@ -1,0 +1,20 @@
+{
+  "experiment": "kv_cache_baseline",
+  "model": "mujahid-reasoner",
+  "model_parameters": 12913920,
+  "device": "cpu",
+  "prompt_tokens": 17,
+  "requested_new_tokens": 50,
+  "deterministic": true,
+  "without_kv_cache": {
+    "time_seconds": 7.353,
+    "tokens": 50,
+    "tokens_per_second": 6.80
+  },
+  "with_kv_cache": {
+    "time_seconds": 1.764,
+    "tokens": 50,
+    "tokens_per_second": 28.34
+  },
+  "speedup": 4.17
+}

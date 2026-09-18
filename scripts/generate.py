@@ -82,11 +82,12 @@ def main() -> None:
         top_p=0.9,
     )
 
-    print("\nGenerating...\n")
+    print("\nGenerating with KV cache...\n")
 
     output = generator.generate(
-        prompt,
-        generation_config,
+        prompt=prompt,
+        config=generation_config,
+        use_cache=True,
     )
 
     print("=" * 60)

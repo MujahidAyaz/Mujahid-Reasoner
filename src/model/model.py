@@ -4,13 +4,14 @@ import torch
 from torch import Tensor, nn
 
 from src.model.block import TransformerBlock
+from src.model.cache import LayerKVCache
 from src.model.config import ModelConfig
 from src.model.norm import RMSNorm
 
 
 class MujahidReasonerModel(nn.Module):
     """
-    Decoder-only Transformer language model.
+    Decoder-only Transformer language model with optional KV caching.
 
     Architecture:
 
@@ -31,11 +32,22 @@ class MujahidReasonerModel(nn.Module):
             ▼
         Logits
 
-    Input:
-        [batch, sequence_length]
+    Normal forward:
+        Input:
+            [batch, sequence_length]
 
-    Output:
-        [batch, sequence_length, vocab_size]
+        Output:
+            [batch, sequence_length, vocab_size]
+
+    Cached forward:
+        Input:
+            New token(s) only
+
+        Cache:
+            Previous K/V states for every Transformer layer
+
+        Output:
+            Logits for new token(s) only
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -107,7 +119,9 @@ class MujahidReasonerModel(nn.Module):
         self,
         input_ids: Tensor,
         position_offset: int = 0,
-    ) -> Tensor:
+        cache: LayerKVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, LayerKVCache | None]:
         """
         Run the decoder-only Transformer.
 
@@ -119,9 +133,21 @@ class MujahidReasonerModel(nn.Module):
             position_offset:
                 Starting position for RoPE.
 
+            cache:
+                Optional KV cache containing previous states
+                for every Transformer layer.
+
+            use_cache:
+                Whether to return an updated KV cache.
+
         Returns:
-            Logits with shape
-            [batch, sequence_length, vocab_size].
+            logits:
+                Tensor with shape
+                [batch, sequence_length, vocab_size].
+
+            updated_cache:
+                Updated cache for all Transformer layers,
+                or None when caching is disabled.
         """
 
         if input_ids.ndim != 2:
@@ -168,19 +194,68 @@ class MujahidReasonerModel(nn.Module):
                 "the configured vocabulary."
             )
 
+        if cache is not None:
+            if len(cache) != len(self.layers):
+                raise ValueError(
+                    "KV cache layer count does not match "
+                    "the number of Transformer layers."
+                )
+
+            if cache.layers[0] is not None:
+                if cache.layers[0].key.size(0) != batch_size:
+                    raise ValueError(
+                        "KV cache batch size does not match "
+                        "the input batch size."
+                    )
+
+                if (
+                    cache.layers[0].sequence_length
+                    != position_offset
+                ):
+                    raise ValueError(
+                        "KV cache sequence length must match "
+                        "position_offset."
+                    )
+
         x = self.token_embedding(input_ids)
 
-        for layer in self.layers:
-            x = layer(
+        updated_cache = None
+
+        if use_cache:
+            updated_cache = LayerKVCache.empty(
+                num_layers=len(self.layers),
+            )
+
+        for layer_index, layer in enumerate(self.layers):
+            layer_cache = (
+                cache[layer_index]
+                if cache is not None
+                else None
+            )
+
+            x, layer_updated_cache = layer(
                 x,
                 position_offset=position_offset,
+                cache=layer_cache,
+                use_cache=use_cache,
             )
+
+            if use_cache:
+                if layer_updated_cache is None:
+                    raise RuntimeError(
+                        "Layer did not return a KV cache "
+                        "when use_cache=True."
+                    )
+
+                updated_cache[layer_index] = (
+                    layer_updated_cache
+                )
 
         x = self.final_layernorm(x)
 
         logits = self.lm_head(x)
 
-        return logits
+        return logits, updated_cache
 
     def parameter_count(
         self,

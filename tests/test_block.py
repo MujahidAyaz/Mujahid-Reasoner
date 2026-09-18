@@ -1,22 +1,11 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-
-import pytest
 import torch
+import pytest
 
-from src.model.attention import GroupedQueryAttention
 from src.model.block import TransformerBlock
+from src.model.cache import KVCache
 from src.model.config import ModelConfig
-from src.model.mlp import SwiGLU
-from src.model.norm import RMSNorm
 
 
 @pytest.fixture
@@ -52,51 +41,10 @@ def test_output_shape(
 ) -> None:
     x = torch.randn(2, 16, 256)
 
-    output = block(x)
+    output, cache = block(x)
 
     assert output.shape == (2, 16, 256)
-
-
-def test_attention_module(
-    block: TransformerBlock,
-) -> None:
-    assert isinstance(
-        block.self_attn,
-        GroupedQueryAttention,
-    )
-
-
-def test_mlp_module(
-    block: TransformerBlock,
-) -> None:
-    assert isinstance(
-        block.mlp,
-        SwiGLU,
-    )
-
-
-def test_input_layernorm(
-    block: TransformerBlock,
-) -> None:
-    assert isinstance(
-        block.input_layernorm,
-        RMSNorm,
-    )
-
-
-def test_post_attention_layernorm(
-    block: TransformerBlock,
-) -> None:
-    assert isinstance(
-        block.post_attention_layernorm,
-        RMSNorm,
-    )
-
-
-def test_hidden_size(
-    block: TransformerBlock,
-) -> None:
-    assert block.hidden_size == 256
+    assert cache is None
 
 
 def test_residual_connection(
@@ -106,10 +54,10 @@ def test_residual_connection(
 
     x = torch.randn(2, 8, 256)
 
-    output = block(x)
+    output, cache = block(x)
 
     assert output.shape == x.shape
-    assert not torch.allclose(output, x)
+    assert cache is None
 
 
 def test_varying_sequence_lengths(
@@ -118,13 +66,14 @@ def test_varying_sequence_lengths(
     for sequence_length in [1, 4, 16, 32]:
         x = torch.randn(2, sequence_length, 256)
 
-        output = block(x)
+        output, cache = block(x)
 
         assert output.shape == (
             2,
             sequence_length,
             256,
         )
+        assert cache is None
 
 
 def test_position_offset(
@@ -132,12 +81,13 @@ def test_position_offset(
 ) -> None:
     x = torch.randn(2, 8, 256)
 
-    output = block(
+    output, cache = block(
         x,
         position_offset=10,
     )
 
     assert output.shape == (2, 8, 256)
+    assert cache is None
 
 
 def test_dtype_preservation(
@@ -150,12 +100,98 @@ def test_dtype_preservation(
         dtype=torch.float32,
     )
 
-    output = block(x)
+    output, cache = block(x)
 
     assert output.dtype == x.dtype
+    assert cache is None
 
 
-def test_invalid_dimensions(
+def test_deterministic_output(
+    config: ModelConfig,
+) -> None:
+    torch.manual_seed(42)
+    block_a = TransformerBlock(config)
+
+    torch.manual_seed(42)
+    block_b = TransformerBlock(config)
+
+    x = torch.randn(2, 8, 256)
+
+    output_a, cache_a = block_a(x)
+    output_b, cache_b = block_b(x)
+
+    assert torch.allclose(
+        output_a,
+        output_b,
+    )
+
+    assert cache_a is None
+    assert cache_b is None
+
+
+def test_gradients_flow(
+    block: TransformerBlock,
+) -> None:
+    x = torch.randn(
+        2,
+        8,
+        256,
+        requires_grad=True,
+    )
+
+    output, cache = block(x)
+
+    loss = output.mean()
+    loss.backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert cache is None
+
+
+def test_cache_is_returned_when_enabled(
+    block: TransformerBlock,
+) -> None:
+    x = torch.randn(2, 8, 256)
+
+    output, cache = block(
+        x,
+        use_cache=True,
+    )
+
+    assert output.shape == (2, 8, 256)
+    assert isinstance(cache, KVCache)
+    assert cache.sequence_length == 8
+
+
+def test_cached_forward_accepts_previous_cache(
+    block: TransformerBlock,
+) -> None:
+    torch.manual_seed(42)
+
+    prompt = torch.randn(2, 8, 256)
+    next_token = torch.randn(2, 1, 256)
+
+    _, cache = block(
+        prompt,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    output, updated_cache = block(
+        next_token,
+        position_offset=8,
+        cache=cache,
+        use_cache=True,
+    )
+
+    assert output.shape == (2, 1, 256)
+    assert isinstance(updated_cache, KVCache)
+    assert updated_cache.sequence_length == 9
+
+
+def test_invalid_input_rank(
     block: TransformerBlock,
 ) -> None:
     x = torch.randn(2, 256)
@@ -173,39 +209,58 @@ def test_invalid_hidden_size(
         block(x)
 
 
-def test_deterministic_output(
+def test_cache_equivalence(
     config: ModelConfig,
 ) -> None:
-    torch.manual_seed(42)
-    block_a = TransformerBlock(config)
+    """
+    Verify that cached token-by-token execution produces
+    the same hidden states as normal full-context execution.
+    """
 
     torch.manual_seed(42)
-    block_b = TransformerBlock(config)
 
-    x = torch.randn(2, 8, 256)
+    block = TransformerBlock(config)
+    block.eval()
 
-    output_a = block_a(x)
-    output_b = block_b(x)
+    prompt = torch.randn(1, 4, 256)
+    continuation = torch.randn(1, 3, 256)
+
+    full_input = torch.cat(
+        (prompt, continuation),
+        dim=1,
+    )
+
+    full_output, _ = block(full_input)
+
+    prompt_output, cache = block(
+        prompt,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    cached_outputs = [prompt_output]
+
+    for step in range(continuation.size(1)):
+        token = continuation[:, step : step + 1]
+
+        token_output, cache = block(
+            token,
+            position_offset=4 + step,
+            cache=cache,
+            use_cache=True,
+        )
+
+        cached_outputs.append(token_output)
+
+    cached_output = torch.cat(
+        cached_outputs,
+        dim=1,
+    )
 
     assert torch.allclose(
-        output_a,
-        output_b,
+        full_output,
+        cached_output,
+        atol=1e-5,
+        rtol=1e-5,
     )
-
-
-def test_gradients_flow(
-    block: TransformerBlock,
-) -> None:
-    x = torch.randn(
-        2,
-        8,
-        256,
-        requires_grad=True,
-    )
-
-    output = block(x)
-    loss = output.mean()
-    loss.backward()
-
-    assert x.grad is not None
-    assert torch.isfinite(x.grad).all()

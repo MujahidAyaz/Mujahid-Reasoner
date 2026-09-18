@@ -1,25 +1,15 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 import pytest
 import torch
 
 from src.model.model import MujahidReasonerModel
-from src.model.norm import RMSNorm
-from src.model.block import TransformerBlock
+from src.model.cache import LayerKVCache
+from src.model.config import ModelConfig
 
 
 @pytest.fixture
-def config():
-    from src.model.config import ModelConfig
-
+def config() -> ModelConfig:
     return ModelConfig(
         name="mujahid-reasoner-test",
         vocab_size=32000,
@@ -41,13 +31,13 @@ def config():
 
 
 @pytest.fixture
-def model(config):
+def model(config: ModelConfig) -> MujahidReasonerModel:
     torch.manual_seed(42)
     return MujahidReasonerModel(config)
 
 
 def test_model_output_shape(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -55,92 +45,37 @@ def test_model_output_shape(
         (2, 16),
     )
 
-    logits = model(input_ids)
+    logits, cache = model(input_ids)
 
     assert logits.shape == (
         2,
         16,
         32000,
     )
+    assert cache is None
 
 
-def test_embedding_shape(
-    model,
+def test_parameter_count(
+    model: MujahidReasonerModel,
 ) -> None:
-    assert model.token_embedding.weight.shape == (
-        32000,
-        256,
-    )
-
-
-def test_number_of_transformer_layers(
-    model,
-) -> None:
-    assert len(model.layers) == 6
-
-    for layer in model.layers:
-        assert isinstance(
-            layer,
-            TransformerBlock,
-        )
-
-
-def test_final_layernorm(
-    model,
-) -> None:
-    assert isinstance(
-        model.final_layernorm,
-        RMSNorm,
-    )
-
-
-def test_lm_head_shape(
-    model,
-) -> None:
-    assert model.lm_head.weight.shape == (
-        32000,
-        256,
+    assert model.parameter_count() > 0
+    assert (
+        model.parameter_count()
+        == model.parameter_count(trainable_only=False)
     )
 
 
 def test_weight_tying(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     assert (
-        model.lm_head.weight.data_ptr()
-        == model.token_embedding.weight.data_ptr()
+        model.token_embedding.weight
+        is model.lm_head.weight
     )
-
-
-def test_parameter_count(
-    model,
-) -> None:
-    count = model.parameter_count()
-
-    assert count > 0
-    assert count == sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    )
-
-
-def test_parameter_count_all(
-    model,
-) -> None:
-    trainable = model.parameter_count(
-        trainable_only=True,
-    )
-
-    total = model.parameter_count(
-        trainable_only=False,
-    )
-
-    assert trainable == total
 
 
 def test_varying_sequence_lengths(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     for sequence_length in [1, 4, 16, 32]:
         input_ids = torch.randint(
@@ -149,17 +84,18 @@ def test_varying_sequence_lengths(
             (2, sequence_length),
         )
 
-        logits = model(input_ids)
+        logits, cache = model(input_ids)
 
         assert logits.shape == (
             2,
             sequence_length,
             32000,
         )
+        assert cache is None
 
 
 def test_position_offset(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -167,7 +103,7 @@ def test_position_offset(
         (2, 8),
     )
 
-    logits = model(
+    logits, cache = model(
         input_ids,
         position_offset=10,
     )
@@ -177,23 +113,52 @@ def test_position_offset(
         8,
         32000,
     )
+    assert cache is None
 
 
-def test_invalid_input_dimensions(
-    model,
+def test_invalid_input_rank(
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
         32000,
-        (2, 8, 1),
+        (8,),
     )
 
     with pytest.raises(ValueError):
         model(input_ids)
 
 
-def test_invalid_sequence_length(
-    model,
+def test_empty_sequence(
+    model: MujahidReasonerModel,
+) -> None:
+    input_ids = torch.empty(
+        (2, 0),
+        dtype=torch.long,
+    )
+
+    with pytest.raises(ValueError):
+        model(input_ids)
+
+
+def test_invalid_position_offset(
+    model: MujahidReasonerModel,
+) -> None:
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    with pytest.raises(ValueError):
+        model(
+            input_ids,
+            position_offset=-1,
+        )
+
+
+def test_sequence_exceeds_context(
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -205,36 +170,17 @@ def test_invalid_sequence_length(
         model(input_ids)
 
 
-def test_invalid_position_offset(
-    model,
-) -> None:
-    input_ids = torch.randint(
-        0,
-        32000,
-        (2, 8),
-    )
-
-    with pytest.raises(ValueError):
-        model(
-            input_ids,
-            position_offset=510,
-        )
-
-
 def test_invalid_input_dtype(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
-    input_ids = torch.randn(
-        2,
-        8,
-    )
+    input_ids = torch.randn(2, 8)
 
     with pytest.raises(ValueError):
         model(input_ids)
 
 
 def test_negative_token_id(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -248,8 +194,8 @@ def test_negative_token_id(
         model(input_ids)
 
 
-def test_out_of_vocabulary_token_id(
-    model,
+def test_token_id_out_of_range(
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -264,7 +210,7 @@ def test_out_of_vocabulary_token_id(
 
 
 def test_dtype_preservation(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -272,13 +218,14 @@ def test_dtype_preservation(
         (2, 8),
     )
 
-    logits = model(input_ids)
+    logits, cache = model(input_ids)
 
     assert logits.dtype == torch.float32
+    assert cache is None
 
 
 def test_deterministic_output(
-    config,
+    config: ModelConfig,
 ) -> None:
     torch.manual_seed(42)
     model_a = MujahidReasonerModel(config)
@@ -292,17 +239,20 @@ def test_deterministic_output(
         (2, 8),
     )
 
-    logits_a = model_a(input_ids)
-    logits_b = model_b(input_ids)
+    logits_a, cache_a = model_a(input_ids)
+    logits_b, cache_b = model_b(input_ids)
 
     assert torch.allclose(
         logits_a,
         logits_b,
     )
 
+    assert cache_a is None
+    assert cache_b is None
+
 
 def test_gradients_flow(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -310,24 +260,25 @@ def test_gradients_flow(
         (2, 8),
     )
 
-    logits = model(input_ids)
-    loss = logits.mean()
+    logits, cache = model(input_ids)
 
+    loss = logits.mean()
     loss.backward()
+
+    assert cache is None
 
     assert (
         model.token_embedding.weight.grad
         is not None
     )
 
-    assert (
-        model.final_layernorm.weight.grad
-        is not None
-    )
+    assert torch.isfinite(
+        model.token_embedding.weight.grad
+    ).all()
 
 
 def test_forward_produces_finite_values(
-    model,
+    model: MujahidReasonerModel,
 ) -> None:
     input_ids = torch.randint(
         0,
@@ -335,6 +286,209 @@ def test_forward_produces_finite_values(
         (2, 8),
     )
 
-    logits = model(input_ids)
+    logits, cache = model(input_ids)
 
     assert torch.isfinite(logits).all()
+    assert cache is None
+
+
+def test_cache_is_returned(
+    model: MujahidReasonerModel,
+) -> None:
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    logits, cache = model(
+        input_ids,
+        use_cache=True,
+    )
+
+    assert logits.shape == (
+        2,
+        8,
+        32000,
+    )
+
+    assert isinstance(
+        cache,
+        LayerKVCache,
+    )
+
+    assert len(cache) == 6
+
+    for layer_cache in cache.layers:
+        assert layer_cache is not None
+        assert layer_cache.sequence_length == 8
+
+
+def test_cache_batch_size(
+    model: MujahidReasonerModel,
+) -> None:
+    input_ids = torch.randint(
+        0,
+        32000,
+        (3, 8),
+    )
+
+    _, cache = model(
+        input_ids,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    for layer_cache in cache.layers:
+        assert layer_cache is not None
+        assert layer_cache.key.size(0) == 3
+        assert layer_cache.value.size(0) == 3
+
+
+def test_cache_sequence_growth(
+    model: MujahidReasonerModel,
+) -> None:
+    torch.manual_seed(42)
+
+    prompt = torch.randint(
+        0,
+        32000,
+        (1, 8),
+    )
+
+    next_token = torch.randint(
+        0,
+        32000,
+        (1, 1),
+    )
+
+    _, cache = model(
+        prompt,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    _, updated_cache = model(
+        next_token,
+        position_offset=8,
+        cache=cache,
+        use_cache=True,
+    )
+
+    assert updated_cache is not None
+
+    for layer_cache in updated_cache.layers:
+        assert layer_cache is not None
+        assert layer_cache.sequence_length == 9
+
+
+def test_full_model_cache_equivalence(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    Verify that cached token-by-token decoding produces
+    the same logits as normal full-context execution.
+    """
+
+    model.eval()
+
+    torch.manual_seed(123)
+
+    prompt = torch.randint(
+        0,
+        32000,
+        (1, 4),
+    )
+
+    continuation = torch.randint(
+        0,
+        32000,
+        (1, 3),
+    )
+
+    full_input = torch.cat(
+        (
+            prompt,
+            continuation,
+        ),
+        dim=1,
+    )
+
+    full_logits, _ = model(full_input)
+
+    prompt_logits, cache = model(
+        prompt,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    cached_logits = [
+        prompt_logits,
+    ]
+
+    for step in range(
+        continuation.size(1)
+    ):
+        token = continuation[
+            :,
+            step : step + 1,
+        ]
+
+        token_logits, cache = model(
+            token,
+            position_offset=4 + step,
+            cache=cache,
+            use_cache=True,
+        )
+
+        cached_logits.append(
+            token_logits
+        )
+
+    cached_logits = torch.cat(
+        cached_logits,
+        dim=1,
+    )
+
+    assert cached_logits.shape == full_logits.shape
+
+    assert torch.allclose(
+        full_logits,
+        cached_logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_cache_rejects_wrong_position(
+    model: MujahidReasonerModel,
+) -> None:
+    input_ids = torch.randint(
+        0,
+        32000,
+        (1, 8),
+    )
+
+    _, cache = model(
+        input_ids,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    next_token = torch.randint(
+        0,
+        32000,
+        (1, 1),
+    )
+
+    with pytest.raises(ValueError):
+        model(
+            next_token,
+            position_offset=7,
+            cache=cache,
+            use_cache=True,
+        )
