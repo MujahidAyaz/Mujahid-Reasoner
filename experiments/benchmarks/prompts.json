@@ -1,0 +1,52 @@
+[
+  {
+    "id": "general_01",
+    "category": "general",
+    "prompt": "Artificial intelligence is changing the world because"
+  },
+  {
+    "id": "general_02",
+    "category": "general",
+    "prompt": "The purpose of education is"
+  },
+  {
+    "id": "science_01",
+    "category": "science",
+    "prompt": "Photosynthesis is the process by which"
+  },
+  {
+    "id": "science_02",
+    "category": "science",
+    "prompt": "The human brain processes information by"
+  },
+  {
+    "id": "math_01",
+    "category": "math",
+    "prompt": "2 + 2 ="
+  },
+  {
+    "id": "math_02",
+    "category": "math",
+    "prompt": "If a number is multiplied by 5 and the result is 25, the number is"
+  },
+  {
+    "id": "code_01",
+    "category": "code",
+    "prompt": "In Python, a function is defined using"
+  },
+  {
+    "id": "code_02",
+    "category": "code",
+    "prompt": "A Python loop that iterates over a list can be written as"
+  },
+  {
+    "id": "reasoning_01",
+    "category": "reasoning",
+    "prompt": "If all cats are animals and Luna is a cat, then Luna is"
+  },
+  {
+    "id": "reasoning_02",
+    "category": "reasoning",
+    "prompt": "Ali is taller than Bilal. Bilal is taller than Hamza. Therefore, Ali is"
+  }
+]

@@ -1,0 +1,166 @@
+{
+  "model": {
+    "name": "mujahid-reasoner",
+    "checkpoint": "experiments\\runs\\mujahid-reasoner\\checkpoints\\best.pt",
+    "parameters": 12913920
+  },
+  "generation_config": {
+    "seed": 42,
+    "max_new_tokens": 50,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.9
+  },
+  "benchmark": {
+    "prompt_count": 10,
+    "total_generated_tokens": 484,
+    "total_generation_seconds": 52.84918269998161,
+    "overall_tokens_per_second": 9.15813594975743,
+    "average_repetition_ratio": 0.43737745441367937,
+    "average_unique_token_ratio": 0.5626225455863206
+  },
+  "categories": {
+    "code": {
+      "prompts": 2,
+      "generated_tokens": 92,
+      "generation_seconds": 9.583369400061201,
+      "average_generated_tokens": 46.0,
+      "average_generation_seconds": 4.791684700030601,
+      "average_tokens_per_second": 9.619579425869821,
+      "average_repetition_ratio": 0.39090909090909093,
+      "average_unique_token_ratio": 0.6090909090909091
+    },
+    "general": {
+      "prompts": 2,
+      "generated_tokens": 100,
+      "generation_seconds": 11.348611499997787,
+      "average_generated_tokens": 50.0,
+      "average_generation_seconds": 5.674305749998894,
+      "average_tokens_per_second": 8.990458027242878,
+      "average_repetition_ratio": 0.48074866310160425,
+      "average_unique_token_ratio": 0.5192513368983958
+    },
+    "math": {
+      "prompts": 2,
+      "generated_tokens": 96,
+      "generation_seconds": 10.147031000000425,
+      "average_generated_tokens": 48.0,
+      "average_generation_seconds": 5.073515500000212,
+      "average_tokens_per_second": 9.567160365097148,
+      "average_repetition_ratio": 0.525595238095238,
+      "average_unique_token_ratio": 0.4744047619047619
+    },
+    "reasoning": {
+      "prompts": 2,
+      "generated_tokens": 96,
+      "generation_seconds": 11.244982399977744,
+      "average_generated_tokens": 48.0,
+      "average_generation_seconds": 5.622491199988872,
+      "average_tokens_per_second": 8.534589023207477,
+      "average_repetition_ratio": 0.4003889969435954,
+      "average_unique_token_ratio": 0.5996110030564046
+    },
+    "science": {
+      "prompts": 2,
+      "generated_tokens": 100,
+      "generation_seconds": 10.525188399944454,
+      "average_generated_tokens": 50.0,
+      "average_generation_seconds": 5.262594199972227,
+      "average_tokens_per_second": 9.524666342825231,
+      "average_repetition_ratio": 0.3892452830188679,
+      "average_unique_token_ratio": 0.610754716981132
+    }
+  },
+  "prompts": [
+    {
+      "id": "general_01",
+      "category": "general",
+      "generated_tokens": 50,
+      "generation_seconds": 6.474535199988168,
+      "tokens_per_second": 7.722562076748209,
+      "repetition_ratio": 0.4909090909090909,
+      "unique_token_ratio": 0.509090909090909
+    },
+    {
+      "id": "general_02",
+      "category": "general",
+      "generated_tokens": 50,
+      "generation_seconds": 4.8740763000096194,
+      "tokens_per_second": 10.25835397773755,
+      "repetition_ratio": 0.47058823529411764,
+      "unique_token_ratio": 0.5294117647058824
+    },
+    {
+      "id": "science_01",
+      "category": "science",
+      "generated_tokens": 50,
+      "generation_seconds": 5.000366099993698,
+      "tokens_per_second": 9.99926785362036,
+      "repetition_ratio": 0.3584905660377358,
+      "unique_token_ratio": 0.6415094339622641
+    },
+    {
+      "id": "science_02",
+      "category": "science",
+      "generated_tokens": 50,
+      "generation_seconds": 5.524822299950756,
+      "tokens_per_second": 9.050064832030102,
+      "repetition_ratio": 0.42,
+      "unique_token_ratio": 0.58
+    },
+    {
+      "id": "math_01",
+      "category": "math",
+      "generated_tokens": 46,
+      "generation_seconds": 4.424168199999258,
+      "tokens_per_second": 10.397434708745413,
+      "repetition_ratio": 0.575,
+      "unique_token_ratio": 0.425
+    },
+    {
+      "id": "math_02",
+      "category": "math",
+      "generated_tokens": 50,
+      "generation_seconds": 5.722862800001167,
+      "tokens_per_second": 8.736886021448882,
+      "repetition_ratio": 0.47619047619047616,
+      "unique_token_ratio": 0.5238095238095238
+    },
+    {
+      "id": "code_01",
+      "category": "code",
+      "generated_tokens": 46,
+      "generation_seconds": 4.575308000028599,
+      "tokens_per_second": 10.053967951384358,
+      "repetition_ratio": 0.4,
+      "unique_token_ratio": 0.6
+    },
+    {
+      "id": "code_02",
+      "category": "code",
+      "generated_tokens": 46,
+      "generation_seconds": 5.008061400032602,
+      "tokens_per_second": 9.185190900355284,
+      "repetition_ratio": 0.38181818181818183,
+      "unique_token_ratio": 0.6181818181818182
+    },
+    {
+      "id": "reasoning_01",
+      "category": "reasoning",
+      "generated_tokens": 50,
+      "generation_seconds": 5.674267599999439,
+      "tokens_per_second": 8.811709902438324,
+      "repetition_ratio": 0.3770491803278688,
+      "unique_token_ratio": 0.6229508196721312
+    },
+    {
+      "id": "reasoning_02",
+      "category": "reasoning",
+      "generated_tokens": 46,
+      "generation_seconds": 5.570714799978305,
+      "tokens_per_second": 8.25746814397663,
+      "repetition_ratio": 0.423728813559322,
+      "unique_token_ratio": 0.576271186440678
+    }
+  ]
+}

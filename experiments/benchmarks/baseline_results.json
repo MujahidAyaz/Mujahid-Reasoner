@@ -1,0 +1,122 @@
+{
+  "model": {
+    "name": "mujahid-reasoner",
+    "checkpoint": "experiments\\runs\\mujahid-reasoner\\checkpoints\\best.pt",
+    "parameters": 12913920
+  },
+  "generation": {
+    "seed": 42,
+    "max_new_tokens": 50,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.9
+  },
+  "summary": {
+    "prompt_count": 10,
+    "total_generated_tokens": 484,
+    "total_generation_seconds": 52.84918269998161,
+    "average_tokens_per_second": 9.15813594975743
+  },
+  "results": [
+    {
+      "id": "general_01",
+      "category": "general",
+      "prompt": "Artificial intelligence is changing the world because",
+      "output": "Artificial intelligence is changing the world because it was it to the world to the way.\nThis is the time of the time of the number of the first, and the world is a great area to have a use of the same of the world.\n-based that the way is",
+      "prompt_tokens": 8,
+      "generated_tokens": 50,
+      "generation_seconds": 6.474535199988168,
+      "tokens_per_second": 7.722562076748209
+    },
+    {
+      "id": "general_02",
+      "category": "general",
+      "prompt": "The purpose of education is",
+      "output": "The purpose of education is also the world.\nThe same time is the few health is the time and in the large-18.\nA world.\nThe country is a few to have a use of the same of this.\nThe other day of the way for",
+      "prompt_tokens": 5,
+      "generated_tokens": 50,
+      "generation_seconds": 4.8740763000096194,
+      "tokens_per_second": 10.25835397773755
+    },
+    {
+      "id": "science_01",
+      "category": "science",
+      "prompt": "Photosynthesis is the process by which",
+      "output": "Photosynthesis is the process by which are the world, and he was been been to make more years.\n-term is to be able to be no the time.\n-P:\nThe same as they are able to also a very children to be a more than to the",
+      "prompt_tokens": 8,
+      "generated_tokens": 50,
+      "generation_seconds": 5.000366099993698,
+      "tokens_per_second": 9.99926785362036
+    },
+    {
+      "id": "science_02",
+      "category": "science",
+      "prompt": "The human brain processes information by",
+      "output": "The human brain processes information by a time-s:\nI-S-H-p-P-1. This is a country and an world.\n-mP-in/in).\n-18.\n-d.\n-based:\n-1",
+      "prompt_tokens": 6,
+      "generated_tokens": 50,
+      "generation_seconds": 5.524822299950756,
+      "tokens_per_second": 9.050064832030102
+    },
+    {
+      "id": "math_01",
+      "category": "math",
+      "prompt": "2 + 2 =",
+      "output": "2 + 2 =-2: A-18.\n-18.\n-N.\n-4.\n-H,\n-\n-e.\n-\n-in, and this,\n-5.\n-2.",
+      "prompt_tokens": 4,
+      "generated_tokens": 46,
+      "generation_seconds": 4.424168199999258,
+      "tokens_per_second": 10.397434708745413
+    },
+    {
+      "id": "math_02",
+      "category": "math",
+      "prompt": "If a number is multiplied by 5 and the result is 25, the number is",
+      "output": "If a number is multiplied by 5 and the result is 25, the number is also the world.\nThe same time is the few health is the time and in the large number of the own.\nA day is that is a area to have a use of the same of this.\nThe other day of the way for",
+      "prompt_tokens": 16,
+      "generated_tokens": 50,
+      "generation_seconds": 5.722862800001167,
+      "tokens_per_second": 8.736886021448882
+    },
+    {
+      "id": "code_01",
+      "category": "code",
+      "prompt": "In Python, a function is defined using",
+      "output": "In Python, a function is defined using a small-s.\nI is a major year in the time, and in the large-18.\nA world.\nThe country is a few to have a state of the same of this.\n-2.",
+      "prompt_tokens": 8,
+      "generated_tokens": 46,
+      "generation_seconds": 4.575308000028599,
+      "tokens_per_second": 10.053967951384358
+    },
+    {
+      "id": "code_02",
+      "category": "code",
+      "prompt": "A Python loop that iterates over a list can be written as",
+      "output": "A Python loop that iterates over a list can be written as it was to the “the same time that the few health is the time and in the large-1.\nA world.\nThe country is a few to have a use of the same of this.\n-2.",
+      "prompt_tokens": 13,
+      "generated_tokens": 46,
+      "generation_seconds": 5.008061400032602,
+      "tokens_per_second": 9.185190900355284
+    },
+    {
+      "id": "reasoning_01",
+      "category": "reasoning",
+      "prompt": "If all cats are animals and Luna is a cat, then Luna is",
+      "output": "If all cats are animals and Luna is a cat, then Luna is also a world.\nThe same time is not on the country or a lot of the large-18.\nA world were the world is a great area to have a use of the same of this.\nThe other day of the way for",
+      "prompt_tokens": 16,
+      "generated_tokens": 50,
+      "generation_seconds": 5.674267599999439,
+      "tokens_per_second": 8.811709902438324
+    },
+    {
+      "id": "reasoning_02",
+      "category": "reasoning",
+      "prompt": "Ali is taller than Bilal. Bilal is taller than Hamza. Therefore, Ali is",
+      "output": "Ali is taller than Bilal. Bilal is taller than Hamza. Therefore, Ali is also are an lot of the same time and the few health is the time and in the large-18.\nA:\n-or is a great area to have a use of the same of this.\n-2.",
+      "prompt_tokens": 20,
+      "generated_tokens": 46,
+      "generation_seconds": 5.570714799978305,
+      "tokens_per_second": 8.25746814397663
+    }
+  ]
+}
