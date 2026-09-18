@@ -13,6 +13,7 @@ from src.model.model import MujahidReasonerModel
 
 @dataclass(frozen=True)
 class GenerationConfig:
+    min_new_tokens: int = 0
     max_new_tokens: int = 100
     temperature: float = 0.8
     top_k: int = 50
@@ -41,6 +42,8 @@ class TextGenerator:
     - Frequency penalties.
     - Presence penalties.
     - Stop sequences.
+    - Minimum generation length.
+    - Maximum generation length.
 
     The existing `generate()` API is preserved so current
     callers remain compatible.
@@ -68,7 +71,7 @@ class TextGenerator:
 
         if self.eos_token_id is None:
             raise ValueError(
-                "Tokenizer does not contain an <eos> token."
+                "Tokenizer does not contain a <eos> token."
             )
 
     # ------------------------------------------------------------------
@@ -196,6 +199,7 @@ class TextGenerator:
         """Generate using incremental KV-cache decoding."""
 
         generated_ids = input_ids[0].tolist()
+        prompt_length = len(generated_ids)
 
         logits, cache = self.model(
             input_ids,
@@ -223,18 +227,33 @@ class TextGenerator:
 
             generated_ids.append(token_id)
 
+            generated_token_count = (
+                len(generated_ids) - prompt_length
+            )
+
             current_text = self.tokenizer.decode(
-                generated_ids[len(input_ids[0]):],
+                generated_ids[prompt_length:],
                 skip_special_tokens=True,
             )
 
-            if self._contains_stop_sequence(
-                current_text,
-                config.stop_sequences,
+            can_stop = self._can_stop(
+                generated_token_count,
+                config.min_new_tokens,
+            )
+
+            if (
+                can_stop
+                and self._contains_stop_sequence(
+                    current_text,
+                    config.stop_sequences,
+                )
             ):
                 break
 
-            if token_id == self.eos_token_id:
+            if (
+                token_id == self.eos_token_id
+                and can_stop
+            ):
                 break
 
             position_offset = self._get_cache_length(
@@ -288,7 +307,9 @@ class TextGenerator:
 
         next_logits = logits[:, -1, :]
 
-        generated_ids: list[int] = []
+        generated_ids = input_ids[0].tolist()
+        prompt_length = len(generated_ids)
+
         emitted_text = ""
 
         for _ in range(config.max_new_tokens):
@@ -305,17 +326,30 @@ class TextGenerator:
 
             generated_ids.append(token_id)
 
+            generated_token_count = (
+                len(generated_ids) - prompt_length
+            )
+
             current_text = self.tokenizer.decode(
-                generated_ids,
+                generated_ids[prompt_length:],
                 skip_special_tokens=True,
             )
 
-            safe_text, should_stop = (
-                self._get_safe_stream_text(
-                    current_text,
-                    config.stop_sequences,
-                )
+            can_stop = self._can_stop(
+                generated_token_count,
+                config.min_new_tokens,
             )
+
+            if can_stop:
+                safe_text, should_stop = (
+                    self._get_safe_stream_text(
+                        current_text,
+                        config.stop_sequences,
+                    )
+                )
+            else:
+                safe_text = current_text
+                should_stop = False
 
             chunk = safe_text[len(emitted_text):]
 
@@ -327,14 +361,17 @@ class TextGenerator:
             if should_stop:
                 break
 
-            if token_id == self.eos_token_id:
+            if (
+                token_id == self.eos_token_id
+                and can_stop
+            ):
                 break
 
             position_offset = self._get_cache_length(
                 cache,
                 fallback=(
                     len(input_ids[0])
-                    + len(generated_ids)
+                    + generated_token_count
                     - 1
                 ),
             )
@@ -372,6 +409,7 @@ class TextGenerator:
         """
 
         generated_ids = input_ids[0].tolist()
+        prompt_length = len(generated_ids)
 
         for _ in range(config.max_new_tokens):
             context_ids = generated_ids[
@@ -407,18 +445,33 @@ class TextGenerator:
 
             generated_ids.append(token_id)
 
+            generated_token_count = (
+                len(generated_ids) - prompt_length
+            )
+
             current_text = self.tokenizer.decode(
-                generated_ids[len(input_ids[0]):],
+                generated_ids[prompt_length:],
                 skip_special_tokens=True,
             )
 
-            if self._contains_stop_sequence(
-                current_text,
-                config.stop_sequences,
+            can_stop = self._can_stop(
+                generated_token_count,
+                config.min_new_tokens,
+            )
+
+            if (
+                can_stop
+                and self._contains_stop_sequence(
+                    current_text,
+                    config.stop_sequences,
+                )
             ):
                 break
 
-            if token_id == self.eos_token_id:
+            if (
+                token_id == self.eos_token_id
+                and can_stop
+            ):
                 break
 
         return generated_ids
@@ -440,9 +493,9 @@ class TextGenerator:
         """
 
         generated_ids = input_ids[0].tolist()
-        emitted_text = ""
+        prompt_length = len(generated_ids)
 
-        prompt_length = len(input_ids[0])
+        emitted_text = ""
 
         for _ in range(config.max_new_tokens):
             context_ids = generated_ids[
@@ -478,17 +531,30 @@ class TextGenerator:
 
             generated_ids.append(token_id)
 
+            generated_token_count = (
+                len(generated_ids) - prompt_length
+            )
+
             generated_text = self.tokenizer.decode(
                 generated_ids[prompt_length:],
                 skip_special_tokens=True,
             )
 
-            safe_text, should_stop = (
-                self._get_safe_stream_text(
-                    generated_text,
-                    config.stop_sequences,
-                )
+            can_stop = self._can_stop(
+                generated_token_count,
+                config.min_new_tokens,
             )
+
+            if can_stop:
+                safe_text, should_stop = (
+                    self._get_safe_stream_text(
+                        generated_text,
+                        config.stop_sequences,
+                    )
+                )
+            else:
+                safe_text = generated_text
+                should_stop = False
 
             chunk = safe_text[len(emitted_text):]
 
@@ -500,7 +566,10 @@ class TextGenerator:
             if should_stop:
                 break
 
-            if token_id == self.eos_token_id:
+            if (
+                token_id == self.eos_token_id
+                and can_stop
+            ):
                 break
 
     # ------------------------------------------------------------------
@@ -595,6 +664,7 @@ class TextGenerator:
 
     @staticmethod
     def _decode_generated_chunk(
+        self,
         generated_ids: list[int],
         previous_text: str = "",
     ) -> tuple[str, str]:
@@ -635,6 +705,15 @@ class TextGenerator:
             return token_ids
 
         return token_ids[-max_length:]
+
+    @staticmethod
+    def _can_stop(
+        generated_token_count: int,
+        min_new_tokens: int,
+    ) -> bool:
+        """Return whether generation is allowed to terminate."""
+
+        return generated_token_count >= min_new_tokens
 
     # ------------------------------------------------------------------
     # Cache helpers
@@ -948,9 +1027,20 @@ class TextGenerator:
     def _validate_generation_config(
         config: GenerationConfig,
     ) -> None:
+        if config.min_new_tokens < 0:
+            raise ValueError(
+                "min_new_tokens must be non-negative."
+            )
+
         if config.max_new_tokens < 0:
             raise ValueError(
                 "max_new_tokens must be non-negative."
+            )
+
+        if config.max_new_tokens < config.min_new_tokens:
+            raise ValueError(
+                "max_new_tokens must be greater than or equal "
+                "to min_new_tokens."
             )
 
         if config.temperature <= 0:
