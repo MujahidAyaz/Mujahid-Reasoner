@@ -227,7 +227,12 @@ class Trainer:
                 batch
             )
 
-            logits = self.model(inputs)
+            model_output = self.model(inputs)
+            logits = (
+                model_output[0]
+                if isinstance(model_output, tuple)
+                else model_output
+            )
 
             loss = self.loss_fn(
                 logits,
@@ -365,7 +370,12 @@ class Trainer:
                 batch
             )
 
-            logits = self.model(inputs)
+            model_output = self.model(inputs)
+            logits = (
+                model_output[0]
+                if isinstance(model_output, tuple)
+                else model_output
+            )
 
             loss = self.loss_fn(
                 logits,

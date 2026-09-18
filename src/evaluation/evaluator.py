@@ -50,7 +50,12 @@ class ModelEvaluator:
             input_ids = input_ids.to(self.device)
             target_ids = target_ids.to(self.device)
 
-            logits = self.model(input_ids)
+            model_output = self.model(input_ids)
+            logits = (
+                model_output[0]
+                if isinstance(model_output, tuple)
+                else model_output
+            )
 
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),

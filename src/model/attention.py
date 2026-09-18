@@ -12,27 +12,7 @@ from src.model.rope import RotaryEmbedding
 
 class GroupedQueryAttention(nn.Module):
     """
-    Grouped Query Attention (GQA) with RoPE and KV caching.
-
-    Query heads can be more numerous than key/value heads.
-
-    Example:
-        Query heads     = 8
-        Key/Value heads = 4
-
-    Each key/value head is shared by two query heads.
-
-    Normal forward:
-        Input  -> [B, T, H]
-
-        Output -> [B, T, H]
-
-    Cached forward:
-        Input  -> new tokens only
-
-        Cache  -> previous K/V states
-
-        Output -> new tokens only
+    Grouped Query Attention (GQA) with RoPE and preallocated KV caching.
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -87,10 +67,7 @@ class GroupedQueryAttention(nn.Module):
             persistent=False,
         )
 
-    def _reshape_query(
-        self,
-        x: Tensor,
-    ) -> Tensor:
+    def _reshape_query(self, x: Tensor) -> Tensor:
         batch_size, sequence_length, _ = x.shape
 
         x = x.view(
@@ -102,10 +79,7 @@ class GroupedQueryAttention(nn.Module):
 
         return x.transpose(1, 2)
 
-    def _reshape_key_value(
-        self,
-        x: Tensor,
-    ) -> Tensor:
+    def _reshape_key_value(self, x: Tensor) -> Tensor:
         batch_size, sequence_length, _ = x.shape
 
         x = x.view(
@@ -117,10 +91,7 @@ class GroupedQueryAttention(nn.Module):
 
         return x.transpose(1, 2)
 
-    def _repeat_key_value(
-        self,
-        x: Tensor,
-    ) -> Tensor:
+    def _repeat_key_value(self, x: Tensor) -> Tensor:
         if self.kv_group_size == 1:
             return x
 
@@ -129,6 +100,42 @@ class GroupedQueryAttention(nn.Module):
             dim=1,
         )
 
+    def _validate_cache(
+        self,
+        cache: KVCache,
+        batch_size: int,
+        position_offset: int,
+    ) -> None:
+        if cache.batch_size != batch_size:
+            raise ValueError(
+                "KV cache batch size does not match "
+                "the attention input."
+            )
+
+        if cache.num_kv_heads != self.num_key_value_heads:
+            raise ValueError(
+                "KV cache head count does not match "
+                "the configured number of KV heads."
+            )
+
+        if cache.head_dim != self.head_dimension:
+            raise ValueError(
+                "KV cache head dimension does not match "
+                "the configured head dimension."
+            )
+
+        if cache.sequence_length != position_offset:
+            raise ValueError(
+                "KV cache sequence length must match "
+                "position_offset."
+            )
+
+        if cache.capacity != self.max_sequence_length:
+            raise ValueError(
+                "KV cache capacity does not match "
+                "the configured maximum sequence length."
+            )
+
     def forward(
         self,
         x: Tensor,
@@ -136,36 +143,6 @@ class GroupedQueryAttention(nn.Module):
         cache: KVCache | None = None,
         use_cache: bool = False,
     ) -> tuple[Tensor, KVCache | None]:
-        """
-        Apply grouped query attention.
-
-        Args:
-            x:
-                Input tensor:
-                [batch, sequence_length, hidden_size]
-
-            position_offset:
-                Starting position for RoPE.
-
-                For normal inference:
-                    0
-
-                For cached decoding:
-                    length of previous cached tokens.
-
-            cache:
-                Previously computed key/value states.
-
-            use_cache:
-                Whether to return the updated KV cache.
-
-        Returns:
-            output:
-                [batch, sequence_length, hidden_size]
-
-            updated_cache:
-                KVCache when use_cache=True, otherwise None.
-        """
 
         if x.ndim != 3:
             raise ValueError(
@@ -218,9 +195,6 @@ class GroupedQueryAttention(nn.Module):
 
         # ------------------------------------------------------------
         # 3. Apply RoPE.
-        #
-        # Query uses the current token positions.
-        # Key uses the same positions before being appended to cache.
         # ------------------------------------------------------------
 
         query = self.rope(
@@ -234,43 +208,54 @@ class GroupedQueryAttention(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # 4. Append new K/V states to the previous cache.
+        # 4. Prepare KV cache.
         # ------------------------------------------------------------
 
         if cache is not None:
-            if cache.key.size(0) != batch_size:
-                raise ValueError(
-                    "KV cache batch size does not match "
-                    "the attention input."
-                )
-
-            if cache.key.size(1) != self.num_key_value_heads:
-                raise ValueError(
-                    "KV cache head count does not match "
-                    "the configured number of KV heads."
-                )
-
-            if cache.key.size(3) != self.head_dimension:
-                raise ValueError(
-                    "KV cache head dimension does not match "
-                    "the configured head dimension."
-                )
-
-            if cache.sequence_length != position_offset:
-                raise ValueError(
-                    "KV cache sequence length must match "
-                    "position_offset."
-                )
-
-            key = torch.cat(
-                (cache.key, key),
-                dim=2,
+            self._validate_cache(
+                cache,
+                batch_size=batch_size,
+                position_offset=position_offset,
             )
 
-            value = torch.cat(
-                (cache.value, value),
-                dim=2,
+            # Write the newly computed K/V states into the
+            # preallocated cache.
+            cache.append(
+                key=key,
+                value=value,
             )
+
+            key, value = cache.get()
+
+        elif use_cache:
+            # Allocate cache storage once for the entire
+            # maximum sequence length.
+            cache = KVCache(
+                key=torch.empty(
+                    batch_size,
+                    self.num_key_value_heads,
+                    self.max_sequence_length,
+                    self.head_dimension,
+                    device=key.device,
+                    dtype=key.dtype,
+                ),
+                value=torch.empty(
+                    batch_size,
+                    self.num_key_value_heads,
+                    self.max_sequence_length,
+                    self.head_dimension,
+                    device=value.device,
+                    dtype=value.dtype,
+                ),
+                sequence_length=0,
+            )
+
+            cache.append(
+                key=key,
+                value=value,
+            )
+
+            key, value = cache.get()
 
         total_sequence_length = key.size(2)
 
@@ -281,26 +266,14 @@ class GroupedQueryAttention(nn.Module):
             )
 
         # ------------------------------------------------------------
-        # 5. Build updated cache before repeating K/V heads.
-        # ------------------------------------------------------------
-
-        updated_cache = None
-
-        if use_cache:
-            updated_cache = KVCache(
-                key=key,
-                value=value,
-            )
-
-        # ------------------------------------------------------------
-        # 6. Expand K/V heads for GQA.
+        # 5. Expand K/V heads for GQA.
         # ------------------------------------------------------------
 
         key = self._repeat_key_value(key)
         value = self._repeat_key_value(value)
 
         # ------------------------------------------------------------
-        # 7. Compute scaled dot-product attention.
+        # 6. Compute scaled dot-product attention.
         # ------------------------------------------------------------
 
         scale = 1.0 / math.sqrt(
@@ -313,47 +286,37 @@ class GroupedQueryAttention(nn.Module):
         ) * scale
 
         # ------------------------------------------------------------
-        # 8. Apply causal masking.
-        #
-        # Normal forward:
-        #   [T, T] causal mask.
-        #
-        # Cached forward:
-        #   new queries may attend to all cached tokens plus
-        #   the current token positions.
+        # 7. Apply causal masking.
         # ------------------------------------------------------------
 
-        if cache is None:
+        if cache is None or position_offset == 0:
             mask = self.causal_mask[
                 :sequence_length,
-                :sequence_length,
+                :total_sequence_length,
             ]
 
         else:
-            cache_length = cache.sequence_length
+            cache_length = position_offset
 
             current_mask = self.causal_mask[
                 :sequence_length,
                 :sequence_length,
             ]
 
-            if cache_length > 0:
-                prefix_mask = torch.ones(
-                    sequence_length,
-                    cache_length,
-                    dtype=torch.bool,
-                    device=x.device,
-                )
+            prefix_mask = torch.ones(
+                sequence_length,
+                cache_length,
+                dtype=torch.bool,
+                device=x.device,
+            )
 
-                mask = torch.cat(
-                    (
-                        prefix_mask,
-                        current_mask,
-                    ),
-                    dim=1,
-                )
-            else:
-                mask = current_mask
+            mask = torch.cat(
+                (
+                    prefix_mask,
+                    current_mask,
+                ),
+                dim=1,
+            )
 
         attention_scores = attention_scores.masked_fill(
             ~mask,
@@ -361,7 +324,7 @@ class GroupedQueryAttention(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # 9. Attention probabilities.
+        # 8. Attention probabilities.
         # ------------------------------------------------------------
 
         attention_weights = torch.softmax(
@@ -370,7 +333,7 @@ class GroupedQueryAttention(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # 10. Weighted combination of values.
+        # 9. Weighted combination of values.
         # ------------------------------------------------------------
 
         attention_output = torch.matmul(
@@ -379,7 +342,7 @@ class GroupedQueryAttention(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # 11. Merge attention heads.
+        # 10. Merge attention heads.
         # ------------------------------------------------------------
 
         attention_output = attention_output.transpose(
@@ -395,11 +358,14 @@ class GroupedQueryAttention(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # 12. Final projection.
+        # 11. Final projection.
         # ------------------------------------------------------------
 
         output = self.o_proj(
             attention_output
         )
 
-        return output, updated_cache
+        if use_cache:
+            return output, cache
+
+        return output

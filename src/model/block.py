@@ -114,12 +114,18 @@ class TransformerBlock(nn.Module):
 
         x = self.input_layernorm(x)
 
-        attention_output, updated_cache = self.self_attn(
+        attention_output_result = self.self_attn(
             x,
             position_offset=position_offset,
             cache=cache,
             use_cache=use_cache,
         )
+
+        if use_cache or cache is not None:
+            attention_output, updated_cache = attention_output_result
+        else:
+            attention_output = attention_output_result
+            updated_cache = None
 
         x = residual + attention_output
 
