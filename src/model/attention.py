@@ -1,8 +1,8 @@
+
 from __future__ import annotations
 
-import math
-
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from src.model.cache import KVCache
@@ -12,7 +12,14 @@ from src.model.rope import RotaryEmbedding
 
 class GroupedQueryAttention(nn.Module):
     """
-    Grouped Query Attention (GQA) with RoPE and preallocated KV caching.
+    Grouped Query Attention (GQA) with:
+
+    - Rotary Positional Embeddings (RoPE)
+    - Preallocated KV caching
+    - PyTorch Scaled Dot-Product Attention (SDPA)
+
+    The implementation preserves the original non-cache API while
+    supporting efficient autoregressive decoding with a KV cache.
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -92,6 +99,16 @@ class GroupedQueryAttention(nn.Module):
         return x.transpose(1, 2)
 
     def _repeat_key_value(self, x: Tensor) -> Tensor:
+        """
+        Expand grouped KV heads to match the number of query heads.
+
+        Example:
+            8 query heads
+            4 KV heads
+
+        Each KV head is repeated twice.
+        """
+
         if self.kv_group_size == 1:
             return x
 
@@ -135,6 +152,54 @@ class GroupedQueryAttention(nn.Module):
                 "KV cache capacity does not match "
                 "the configured maximum sequence length."
             )
+
+    def _build_attention_mask(
+        self,
+        *,
+        sequence_length: int,
+        total_sequence_length: int,
+        position_offset: int,
+        cache: KVCache | None,
+        device: torch.device,
+    ) -> Tensor:
+        """
+        Build the attention mask for both normal and cached decoding.
+
+        Normal/full-context execution:
+            Standard lower-triangular causal mask.
+
+        Cached decoding:
+            Previously generated tokens are visible to the new tokens,
+            while new tokens cannot attend to future new tokens.
+        """
+
+        if cache is None or position_offset == 0:
+            return self.causal_mask[
+                :sequence_length,
+                :total_sequence_length,
+            ]
+
+        cache_length = position_offset
+
+        current_mask = self.causal_mask[
+            :sequence_length,
+            :sequence_length,
+        ]
+
+        prefix_mask = torch.ones(
+            sequence_length,
+            cache_length,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        return torch.cat(
+            (
+                prefix_mask,
+                current_mask,
+            ),
+            dim=1,
+        )
 
     def forward(
         self,
@@ -218,8 +283,6 @@ class GroupedQueryAttention(nn.Module):
                 position_offset=position_offset,
             )
 
-            # Write the newly computed K/V states into the
-            # preallocated cache.
             cache.append(
                 key=key,
                 value=value,
@@ -228,8 +291,6 @@ class GroupedQueryAttention(nn.Module):
             key, value = cache.get()
 
         elif use_cache:
-            # Allocate cache storage once for the entire
-            # maximum sequence length.
             cache = KVCache(
                 key=torch.empty(
                     batch_size,
@@ -273,76 +334,35 @@ class GroupedQueryAttention(nn.Module):
         value = self._repeat_key_value(value)
 
         # ------------------------------------------------------------
-        # 6. Compute scaled dot-product attention.
+        # 6. Build attention mask.
         # ------------------------------------------------------------
 
-        scale = 1.0 / math.sqrt(
-            self.head_dimension
+        attention_mask = self._build_attention_mask(
+            sequence_length=sequence_length,
+            total_sequence_length=total_sequence_length,
+            position_offset=position_offset,
+            cache=cache,
+            device=x.device,
         )
 
-        attention_scores = torch.matmul(
+        # ------------------------------------------------------------
+        # 7. Scaled Dot-Product Attention.
+        #
+        # PyTorch chooses the most appropriate optimized attention
+        # implementation available on the current device.
+        # ------------------------------------------------------------
+
+        attention_output = F.scaled_dot_product_attention(
             query,
-            key.transpose(-2, -1),
-        ) * scale
-
-        # ------------------------------------------------------------
-        # 7. Apply causal masking.
-        # ------------------------------------------------------------
-
-        if cache is None or position_offset == 0:
-            mask = self.causal_mask[
-                :sequence_length,
-                :total_sequence_length,
-            ]
-
-        else:
-            cache_length = position_offset
-
-            current_mask = self.causal_mask[
-                :sequence_length,
-                :sequence_length,
-            ]
-
-            prefix_mask = torch.ones(
-                sequence_length,
-                cache_length,
-                dtype=torch.bool,
-                device=x.device,
-            )
-
-            mask = torch.cat(
-                (
-                    prefix_mask,
-                    current_mask,
-                ),
-                dim=1,
-            )
-
-        attention_scores = attention_scores.masked_fill(
-            ~mask,
-            torch.finfo(attention_scores.dtype).min,
-        )
-
-        # ------------------------------------------------------------
-        # 8. Attention probabilities.
-        # ------------------------------------------------------------
-
-        attention_weights = torch.softmax(
-            attention_scores,
-            dim=-1,
-        )
-
-        # ------------------------------------------------------------
-        # 9. Weighted combination of values.
-        # ------------------------------------------------------------
-
-        attention_output = torch.matmul(
-            attention_weights,
+            key,
             value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
         )
 
         # ------------------------------------------------------------
-        # 10. Merge attention heads.
+        # 8. Merge attention heads.
         # ------------------------------------------------------------
 
         attention_output = attention_output.transpose(
@@ -358,13 +378,14 @@ class GroupedQueryAttention(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # 11. Final projection.
+        # 9. Final projection.
         # ------------------------------------------------------------
 
         output = self.o_proj(
             attention_output
         )
 
+        # Preserve the original non-cache API.
         if use_cache:
             return output, cache
 
