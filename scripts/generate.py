@@ -45,7 +45,9 @@ def main() -> None:
     prompt = input("\nPrompt: ").strip()
 
     if not prompt:
-        raise ValueError("Prompt must not be empty.")
+        raise ValueError(
+            "Prompt must not be empty."
+        )
 
     device = "cpu"
 
@@ -53,7 +55,9 @@ def main() -> None:
         MODEL_CONFIG_PATH
     )
 
-    model = MujahidReasonerModel(model_config)
+    model = MujahidReasonerModel(
+        model_config
+    )
 
     checkpoint = torch.load(
         CHECKPOINT_PATH,
@@ -82,16 +86,23 @@ def main() -> None:
         top_p=0.9,
     )
 
-    print("\nGenerating with KV cache...\n")
+    print("\nGenerating with KV cache + streaming...\n")
+    print(prompt, end="", flush=True)
 
-    output = generator.generate(
+    for chunk in generator.generate_stream(
         prompt=prompt,
         config=generation_config,
         use_cache=True,
-    )
+    ):
+        print(
+            chunk,
+            end="",
+            flush=True,
+        )
 
+    print("\n")
     print("=" * 60)
-    print(output)
+    print("Generation complete.")
     print("=" * 60)
 
 

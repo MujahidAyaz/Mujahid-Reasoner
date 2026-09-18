@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import torch
@@ -22,8 +23,17 @@ class TextGenerator:
     """
     Autoregressive text generator with optional KV caching.
 
-    KV caching avoids recomputing attention keys and values
-    for tokens that have already been processed.
+    Supports:
+
+    - Standard full-text generation.
+    - Incremental streaming generation.
+    - Preallocated KV-cache decoding.
+    - Temperature sampling.
+    - Top-k sampling.
+    - Top-p / nucleus sampling.
+
+    The existing `generate()` API is preserved so current
+    callers remain compatible.
     """
 
     def __init__(
@@ -42,14 +52,14 @@ class TextGenerator:
         self.eos_token_id = tokenizer.token_to_id("<eos>")
 
         if self.bos_token_id is None:
-            raise ValueError(
-                "Tokenizer does not contain a <bos> token."
-            )
+            raise ValueError("Tokenizer does not contain a <bos> token.")
 
         if self.eos_token_id is None:
-            raise ValueError(
-                "Tokenizer does not contain an <eos> token."
-            )
+            raise ValueError("Tokenizer does not contain an <eos> token.")
+
+    # ------------------------------------------------------------------
+    # Standard generation API
+    # ------------------------------------------------------------------
 
     @torch.inference_mode()
     def generate(
@@ -59,31 +69,13 @@ class TextGenerator:
         use_cache: bool = True,
     ) -> str:
         """
-        Generate text from a prompt.
-
-        Args:
-            prompt:
-                Input text.
-
-            config:
-                Generation configuration.
-
-            use_cache:
-                Whether to use KV caching.
+        Generate complete text from a prompt.
 
         Returns:
             Generated text including the original prompt.
         """
 
-        if not isinstance(prompt, str):
-            raise TypeError(
-                "prompt must be a string."
-            )
-
-        if not prompt.strip():
-            raise ValueError(
-                "prompt must not be empty."
-            )
+        self._validate_prompt(prompt)
 
         if config is None:
             config = GenerationConfig()
@@ -91,18 +83,12 @@ class TextGenerator:
         self._validate_generation_config(config)
 
         encoded = self.tokenizer.encode(prompt)
-
         token_ids = encoded.ids
 
         if not token_ids:
-            raise ValueError(
-                "Tokenizer produced no tokens."
-            )
+            raise ValueError("Tokenizer produced no tokens.")
 
-        if len(token_ids) > self.model.config.max_sequence_length:
-            token_ids = token_ids[
-                -self.model.config.max_sequence_length :
-            ]
+        token_ids = self._truncate_prompt(token_ids)
 
         input_ids = torch.tensor(
             [token_ids],
@@ -126,14 +112,67 @@ class TextGenerator:
             skip_special_tokens=True,
         )
 
+    # ------------------------------------------------------------------
+    # Streaming generation API
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def generate_stream(
+        self,
+        prompt: str,
+        config: GenerationConfig | None = None,
+        use_cache: bool = True,
+    ) -> Iterator[str]:
+        """
+        Stream generated text incrementally.
+
+        Each yielded value contains only newly available text.
+
+        The original prompt is not yielded.
+        """
+
+        self._validate_prompt(prompt)
+
+        if config is None:
+            config = GenerationConfig()
+
+        self._validate_generation_config(config)
+
+        encoded = self.tokenizer.encode(prompt)
+        token_ids = encoded.ids
+
+        if not token_ids:
+            raise ValueError("Tokenizer produced no tokens.")
+
+        token_ids = self._truncate_prompt(token_ids)
+
+        input_ids = torch.tensor(
+            [token_ids],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        if use_cache:
+            yield from self._stream_with_cache(
+                input_ids,
+                config,
+            )
+        else:
+            yield from self._stream_without_cache(
+                input_ids,
+                config,
+            )
+
+    # ------------------------------------------------------------------
+    # Cached generation
+    # ------------------------------------------------------------------
+
     def _generate_with_cache(
         self,
         input_ids: Tensor,
         config: GenerationConfig,
     ) -> list[int]:
-        """
-        Generate using incremental KV-cache decoding.
-        """
+        """Generate using incremental KV-cache decoding."""
 
         generated_ids = input_ids[0].tolist()
 
@@ -143,18 +182,12 @@ class TextGenerator:
         )
 
         if cache is None:
-            raise RuntimeError(
-                "Model did not return a KV cache."
-            )
+            raise RuntimeError("Model did not return a KV cache.")
 
         next_logits = logits[:, -1, :]
 
         for _ in range(config.max_new_tokens):
-            if (
-                cache.layers[0] is not None
-                and cache.layers[0].sequence_length
-                >= self.model.config.max_sequence_length
-            ):
+            if self._cache_is_full(cache):
                 break
 
             next_token = self._sample_token(
@@ -162,25 +195,19 @@ class TextGenerator:
                 config,
             )
 
-            token_id = int(
-                next_token.item()
-            )
+            token_id = int(next_token.item())
 
             generated_ids.append(token_id)
 
             if token_id == self.eos_token_id:
                 break
 
-            position_offset = (
-                cache.layers[0].sequence_length
-                if cache.layers[0] is not None
-                else len(generated_ids) - 1
+            position_offset = self._get_cache_length(
+                cache,
+                fallback=len(generated_ids) - 1,
             )
 
-            next_input = next_token.view(
-                1,
-                1,
-            )
+            next_input = next_token.view(1, 1)
 
             logits, cache = self.model(
                 next_input,
@@ -198,6 +225,81 @@ class TextGenerator:
 
         return generated_ids
 
+    # ------------------------------------------------------------------
+    # Cached streaming generation
+    # ------------------------------------------------------------------
+
+    def _stream_with_cache(
+        self,
+        input_ids: Tensor,
+        config: GenerationConfig,
+    ) -> Iterator[str]:
+        """
+        Stream generation using incremental KV-cache decoding.
+        """
+
+        logits, cache = self.model(
+            input_ids,
+            use_cache=True,
+        )
+
+        if cache is None:
+            raise RuntimeError("Model did not return a KV cache.")
+
+        next_logits = logits[:, -1, :]
+
+        generated_ids: list[int] = []
+        streamed_text = ""
+
+        for _ in range(config.max_new_tokens):
+            if self._cache_is_full(cache):
+                break
+
+            next_token = self._sample_token(
+                next_logits,
+                config,
+            )
+
+            token_id = int(next_token.item())
+
+            generated_ids.append(token_id)
+
+            if token_id == self.eos_token_id:
+                break
+
+            chunk, streamed_text = self._decode_generated_chunk(
+                generated_ids,
+                previous_text=streamed_text,
+            )
+
+            if chunk:
+                yield chunk
+
+            position_offset = self._get_cache_length(
+                cache,
+                fallback=len(input_ids[0]) + len(generated_ids) - 1,
+            )
+
+            next_input = next_token.view(1, 1)
+
+            logits, cache = self.model(
+                next_input,
+                position_offset=position_offset,
+                cache=cache,
+                use_cache=True,
+            )
+
+            if cache is None:
+                raise RuntimeError(
+                    "Model stopped returning the KV cache."
+                )
+
+            next_logits = logits[:, -1, :]
+
+    # ------------------------------------------------------------------
+    # Non-cached generation
+    # ------------------------------------------------------------------
+
     def _generate_without_cache(
         self,
         input_ids: Tensor,
@@ -214,7 +316,7 @@ class TextGenerator:
 
         for _ in range(config.max_new_tokens):
             context_ids = generated_ids[
-                -self.model.config.max_sequence_length :
+                -self.model.config.max_sequence_length:
             ]
 
             context = torch.tensor(
@@ -223,9 +325,15 @@ class TextGenerator:
                 device=self.device,
             )
 
-            logits, _ = self.model(
+            model_output = self.model(
                 context,
                 use_cache=False,
+            )
+
+            logits = (
+                model_output[0]
+                if isinstance(model_output, tuple)
+                else model_output
             )
 
             next_logits = logits[:, -1, :]
@@ -235,9 +343,7 @@ class TextGenerator:
                 config,
             )
 
-            token_id = int(
-                next_token.item()
-            )
+            token_id = int(next_token.item())
 
             generated_ids.append(token_id)
 
@@ -245,6 +351,157 @@ class TextGenerator:
                 break
 
         return generated_ids
+
+    # ------------------------------------------------------------------
+    # Non-cached streaming generation
+    # ------------------------------------------------------------------
+
+    def _stream_without_cache(
+        self,
+        input_ids: Tensor,
+        config: GenerationConfig,
+    ) -> Iterator[str]:
+        """
+        Stream generation without KV caching.
+
+        This path exists primarily for correctness testing and
+        benchmarking. Cached streaming should be preferred.
+        """
+
+        generated_ids = input_ids[0].tolist()
+        streamed_ids: list[int] = []
+        streamed_text = ""
+
+        for _ in range(config.max_new_tokens):
+            context_ids = generated_ids[
+                -self.model.config.max_sequence_length:
+            ]
+
+            context = torch.tensor(
+                [context_ids],
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            model_output = self.model(
+                context,
+                use_cache=False,
+            )
+
+            logits = (
+                model_output[0]
+                if isinstance(model_output, tuple)
+                else model_output
+            )
+
+            next_logits = logits[:, -1, :]
+
+            next_token = self._sample_token(
+                next_logits,
+                config,
+            )
+
+            token_id = int(next_token.item())
+
+            generated_ids.append(token_id)
+
+            if token_id == self.eos_token_id:
+                break
+
+            streamed_ids.append(token_id)
+
+            chunk, streamed_text = self._decode_generated_chunk(
+                streamed_ids,
+                previous_text=streamed_text,
+            )
+
+            if chunk:
+                yield chunk
+
+    # ------------------------------------------------------------------
+    # Decoding helpers
+    # ------------------------------------------------------------------
+
+    def _decode_generated_chunk(
+        self,
+        generated_ids: list[int],
+        previous_text: str = "",
+    ) -> tuple[str, str]:
+        """
+        Decode the generated token prefix and return only the newly
+        available text.
+
+        Returns:
+            A tuple containing:
+
+            - newly generated text chunk
+            - complete decoded generated text so far
+        """
+
+        current_text = self.tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+        )
+
+        if current_text.startswith(previous_text):
+            chunk = current_text[len(previous_text):]
+        else:
+            chunk = current_text
+
+        return chunk, current_text
+
+    def _truncate_prompt(
+        self,
+        token_ids: list[int],
+    ) -> list[int]:
+        """
+        Keep only the most recent tokens that fit the context window.
+        """
+
+        max_length = self.model.config.max_sequence_length
+
+        if len(token_ids) <= max_length:
+            return token_ids
+
+        return token_ids[-max_length:]
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_is_full(
+        self,
+        cache: LayerKVCache,
+    ) -> bool:
+        if not cache.layers:
+            return False
+
+        first_layer = cache.layers[0]
+
+        if first_layer is None:
+            return False
+
+        return (
+            first_layer.sequence_length
+            >= self.model.config.max_sequence_length
+        )
+
+    @staticmethod
+    def _get_cache_length(
+        cache: LayerKVCache,
+        fallback: int,
+    ) -> int:
+        if cache.layers:
+            first_layer = cache.layers[0]
+
+            if first_layer is not None:
+                return first_layer.sequence_length
+
+        return fallback
+
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _sample_token(
@@ -328,9 +585,7 @@ class TextGenerator:
             dim=-1,
         )
 
-        remove_mask = (
-            cumulative_probabilities > top_p
-        )
+        remove_mask = cumulative_probabilities > top_p
 
         remove_mask[..., 1:] = (
             remove_mask[..., :-1].clone()
@@ -348,6 +603,20 @@ class TextGenerator:
             sorted_indices,
             sorted_logits,
         )
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_prompt(
+        prompt: str,
+    ) -> None:
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string.")
+
+        if not prompt.strip():
+            raise ValueError("prompt must not be empty.")
 
     @staticmethod
     def _validate_generation_config(
