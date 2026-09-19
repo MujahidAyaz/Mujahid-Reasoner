@@ -13,10 +13,19 @@ dataloader:
   shuffle: true
   num_workers: 0
   pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
   drop_last: false
 
 training:
-  device: "cpu"
+  device: "auto"
+  precision: "auto"
+
+  compile: false
+  gradient_checkpointing: false
+
+  allow_tf32: true
+  cudnn_benchmark: true
 
   max_epochs: 1
   max_steps: 1000
@@ -26,7 +35,6 @@ training:
 
   learning_rate: 0.0003
   weight_decay: 0.1
-
   beta1: 0.9
   beta2: 0.95
   optimizer_eps: 0.00000001
@@ -37,7 +45,6 @@ training:
   log_every_steps: 10
   eval_every_steps: 100
   checkpoint_every_steps: 100
-
   max_eval_batches: 20
 
   seed: 42

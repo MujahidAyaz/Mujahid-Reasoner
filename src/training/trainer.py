@@ -14,11 +14,19 @@ from src.training.checkpoint import CheckpointManager
 from src.training.gradient_clipping import clip_gradients
 from src.training.loss import CausalLanguageModelLoss
 from src.training.metrics import TrainingMetrics, TrainingTimer
+from src.training.runtime import TrainingRuntime
 
 
 @dataclass(frozen=True)
 class TrainerConfig:
+    """Configuration for the training loop."""
+
     device: str = "cpu"
+    precision: str = "fp32"
+
+    allow_tf32: bool = True
+    cudnn_benchmark: bool = True
+
     max_epochs: int = 1
     max_steps: int | None = None
     gradient_accumulation_steps: int = 1
@@ -41,7 +49,7 @@ class TrainerConfig:
             and self.max_steps <= 0
         ):
             raise ValueError(
-                "max_steps must be greater than 0."
+                "max_steps must be greater than 0 when provided."
             )
 
         if self.gradient_accumulation_steps <= 0:
@@ -74,7 +82,8 @@ class TrainerConfig:
             and self.max_eval_batches <= 0
         ):
             raise ValueError(
-                "max_eval_batches must be greater than 0."
+                "max_eval_batches must be greater than 0 "
+                "when provided."
             )
 
         if self.seed < 0:
@@ -85,8 +94,11 @@ class TrainerConfig:
 
 @dataclass
 class TrainingState:
+    """Mutable state of the training process."""
+
     epoch: int = 0
     global_step: int = 0
+    batch_in_epoch: int = 0
 
     best_validation_loss: float = math.inf
 
@@ -101,30 +113,74 @@ class TrainingState:
 
 
 class Trainer:
-    """Production-oriented training loop for causal language models."""
+    """
+    Production-oriented language-model trainer.
+
+    Features:
+        - automatic device/runtime configuration
+        - FP32/FP16/BF16 support
+        - automatic mixed precision
+        - CUDA GradScaler for FP16
+        - gradient accumulation
+        - gradient clipping
+        - optimizer stepping
+        - scheduler stepping
+        - validation
+        - checkpointing
+        - deterministic sampler-aware resume
+        - metric tracking
+        - cumulative elapsed training time
+
+    The numerical runtime is resolved once during initialization.
+    The model is moved to the resolved device before training begins.
+    """
 
     def __init__(
         self,
         *,
         model: nn.Module,
-        train_loader: Any,
-        validation_loader: Any,
+        train_loader,
+        validation_loader,
         optimizer: Optimizer,
         scheduler: LRScheduler | None,
         config: TrainerConfig,
-        loss_fn: nn.Module | None = None,
+        loss_fn: CausalLanguageModelLoss | None = None,
         checkpoint_manager: CheckpointManager | None = None,
+        train_sampler: Any | None = None,
     ) -> None:
         self.config = config
 
-        self.device = torch.device(
-            config.device
+        # --------------------------------------------------------------
+        # Runtime
+        # --------------------------------------------------------------
+
+        self.runtime = TrainingRuntime(
+            device=config.device,
+            precision=config.precision,
+            allow_tf32=config.allow_tf32,
+            cudnn_benchmark=config.cudnn_benchmark,
         )
 
-        self.model = model.to(self.device)
+        self.device = self.runtime.device
+
+        self.model = model.to(
+            self.device
+        )
+
+        self.scaler = (
+            self.runtime.create_grad_scaler()
+        )
+
+        # --------------------------------------------------------------
+        # Data
+        # --------------------------------------------------------------
 
         self.train_loader = train_loader
         self.validation_loader = validation_loader
+
+        # --------------------------------------------------------------
+        # Optimization
+        # --------------------------------------------------------------
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -135,6 +191,10 @@ class Trainer:
             else CausalLanguageModelLoss()
         )
 
+        # --------------------------------------------------------------
+        # Checkpointing
+        # --------------------------------------------------------------
+
         self.checkpoint_manager = (
             checkpoint_manager
             if checkpoint_manager is not None
@@ -144,24 +204,38 @@ class Trainer:
             )
         )
 
+        self.train_sampler = train_sampler
+
+        # --------------------------------------------------------------
+        # State / metrics / timing
+        # --------------------------------------------------------------
+
         self.state = TrainingState()
 
         self.metrics = TrainingMetrics()
 
         self.timer = TrainingTimer()
 
+        self._timer_offset_seconds = 0.0
+
         self._micro_steps_since_update = 0
         self._accumulated_loss = 0.0
         self._accumulated_tokens = 0
+
+        self._last_evaluated_step = -1
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def train(self) -> TrainingState:
-        """Run the training loop."""
+        """Run the training process."""
 
         self.timer.start()
+
+        print(
+            f"Training runtime: {self.runtime.summary()}"
+        )
 
         for epoch in range(
             self.state.epoch,
@@ -169,85 +243,298 @@ class Trainer:
         ):
             self.state.epoch = epoch
 
+            self._prepare_epoch(
+                epoch
+            )
+
             self._train_epoch()
 
             if self._should_stop():
                 break
 
             self.state.epoch = epoch + 1
+            self.state.batch_in_epoch = 0
+
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(
+                    epoch + 1
+                )
 
         self.state.elapsed_seconds = (
-            self.timer.elapsed()
+            self._elapsed_training_seconds()
         )
 
-        # Always perform a final validation pass.
-        final_validation_loss = self.evaluate()
-
-        self.state.validation_loss = (
-            final_validation_loss
-        )
-
+        # Avoid evaluating twice when the final optimizer step
+        # already triggered evaluation.
         if (
-            final_validation_loss
-            < self.state.best_validation_loss
+            self._last_evaluated_step
+            != self.state.global_step
         ):
-            self.state.best_validation_loss = (
+            final_validation_loss = (
+                self.evaluate()
+            )
+
+            self.state.validation_loss = (
                 final_validation_loss
             )
-            is_best = True
+
+            if (
+                final_validation_loss
+                < self.state.best_validation_loss
+            ):
+                self.state.best_validation_loss = (
+                    final_validation_loss
+                )
+
+                is_best = True
+            else:
+                is_best = False
         else:
             is_best = False
 
         self.state.elapsed_seconds = (
-            self.timer.elapsed()
+            self._elapsed_training_seconds()
         )
 
         self._sync_metrics()
 
-        # Always save a final checkpoint.
         self._save_checkpoint(
             is_best=is_best
         )
 
         return self.state
 
+    def resume(
+        self,
+        filename: str = "latest.pt",
+    ) -> TrainingState:
+        """
+        Restore the complete training state.
+
+        This restores:
+            - model
+            - optimizer
+            - scheduler
+            - RNG state
+            - metrics
+            - epoch
+            - batch position
+            - sampler position
+        """
+
+        metadata = self.checkpoint_manager.load(
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            filename=filename,
+        )
+
+        self.state.epoch = int(
+            metadata["epoch"]
+        )
+
+        self.state.global_step = int(
+            metadata["global_step"]
+        )
+
+        self.state.batch_in_epoch = int(
+            metadata.get(
+                "batch_in_epoch",
+                0,
+            )
+        )
+
+        self.state.best_validation_loss = float(
+            metadata["best_validation_loss"]
+        )
+
+        metrics = metadata.get(
+            "metrics",
+            {},
+        )
+
+        if isinstance(
+            metrics,
+            dict,
+        ):
+            self._restore_metrics(
+                metrics
+            )
+
+        self._timer_offset_seconds = (
+            self.state.elapsed_seconds
+        )
+
+        dataloader_state = metadata.get(
+            "dataloader_state"
+        )
+
+        if dataloader_state is not None:
+            self._restore_dataloader_state(
+                dataloader_state
+            )
+
+        elif self.train_sampler is not None:
+            # Compatibility with checkpoints that contain
+            # batch_in_epoch but no sampler state.
+            self._restore_sampler_position_fallback()
+
+        self._sync_metrics()
+
+        return self.state
+
+    def evaluate(self) -> float:
+        """Evaluate the model on the validation DataLoader."""
+
+        was_training = self.model.training
+
+        self.model.eval()
+
+        total_loss = 0.0
+        batch_count = 0
+
+        try:
+            with torch.no_grad():
+                for batch in self.validation_loader:
+                    inputs, targets = (
+                        self._prepare_batch(
+                            batch
+                        )
+                    )
+
+                    with self.runtime.autocast_context():
+                        model_output = self.model(
+                            inputs
+                        )
+
+                        logits = (
+                            model_output[0]
+                            if isinstance(
+                                model_output,
+                                tuple,
+                            )
+                            else model_output
+                        )
+
+                        loss = self.loss_fn(
+                            logits,
+                            targets,
+                        )
+
+                    total_loss += float(
+                        loss.detach().item()
+                    )
+
+                    batch_count += 1
+
+                    if (
+                        self.config.max_eval_batches
+                        is not None
+                        and batch_count
+                        >= self.config.max_eval_batches
+                    ):
+                        break
+
+        finally:
+            if was_training:
+                self.model.train()
+
+        if batch_count == 0:
+            return math.inf
+
+        validation_loss = (
+            total_loss / batch_count
+        )
+
+        self._last_evaluated_step = (
+            self.state.global_step
+        )
+
+        return validation_loss
+
     # ------------------------------------------------------------------
-    # Training
+    # Epoch handling
     # ------------------------------------------------------------------
 
+    def _prepare_epoch(
+        self,
+        epoch: int,
+    ) -> None:
+        """Prepare the sampler for the requested epoch."""
+
+        if self.train_sampler is None:
+            return
+
+        sampler_epoch = getattr(
+            self.train_sampler,
+            "epoch",
+            None,
+        )
+
+        if sampler_epoch != epoch:
+            self.train_sampler.set_epoch(
+                epoch
+            )
+
     def _train_epoch(self) -> None:
+        """Train over the remaining batches of the current epoch."""
+
         self.model.train()
 
         self.optimizer.zero_grad(
             set_to_none=True
         )
 
-        for batch in self.train_loader:
-            inputs, targets = self._prepare_batch(
-                batch
+        self._micro_steps_since_update = 0
+        self._accumulated_loss = 0.0
+        self._accumulated_tokens = 0
+
+        batches_to_skip = (
+            self.state.batch_in_epoch
+        )
+
+        for batch_index, batch in enumerate(
+            self.train_loader
+        ):
+            if batch_index < batches_to_skip:
+                continue
+
+            inputs, targets = (
+                self._prepare_batch(
+                    batch
+                )
             )
 
-            model_output = self.model(inputs)
-            logits = (
-                model_output[0]
-                if isinstance(model_output, tuple)
-                else model_output
+            with self.runtime.autocast_context():
+                model_output = self.model(
+                    inputs
+                )
+
+                logits = (
+                    model_output[0]
+                    if isinstance(
+                        model_output,
+                        tuple,
+                    )
+                    else model_output
+                )
+
+                loss = self.loss_fn(
+                    logits,
+                    targets,
+                )
+
+                scaled_loss = (
+                    loss
+                    / self.config.gradient_accumulation_steps
+                )
+
+            self._backward(
+                scaled_loss
             )
 
-            loss = self.loss_fn(
-                logits,
-                targets,
-            )
-
-            scaled_loss = (
-                loss
-                / self.config.gradient_accumulation_steps
-            )
-
-            scaled_loss.backward()
-
-            self._accumulated_loss += (
-                float(loss.detach().item())
+            self._accumulated_loss += float(
+                loss.detach().item()
             )
 
             self._accumulated_tokens += (
@@ -256,6 +543,10 @@ class Trainer:
 
             self._micro_steps_since_update += 1
 
+            self.state.batch_in_epoch = (
+                batch_index + 1
+            )
+
             if (
                 self._micro_steps_since_update
                 >= self.config.gradient_accumulation_steps
@@ -263,24 +554,84 @@ class Trainer:
                 self._optimizer_step()
 
                 if self._should_stop():
-                    break
+                    return
+
+        # If the epoch ended with a partial gradient
+        # accumulation, do not silently discard it.
+        if not self._should_stop():
+            self._flush_remaining_gradients()
+
+    # ------------------------------------------------------------------
+    # Mixed precision
+    # ------------------------------------------------------------------
+
+    def _backward(
+        self,
+        loss: Tensor,
+    ) -> None:
+        """Run backward with optional gradient scaling."""
+
+        if self.scaler is not None:
+            self.scaler.scale(
+                loss
+            ).backward()
+
+            return
+
+        loss.backward()
+
+    # ------------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------------
 
     def _optimizer_step(self) -> None:
+        """Perform one optimizer update."""
+
+        if self._micro_steps_since_update <= 0:
+            return
+
+        # GradScaler requires gradients to be unscaled before
+        # gradient clipping.
+        if self.scaler is not None:
+            self.scaler.unscale_(
+                self.optimizer
+            )
+
         gradient_norm = clip_gradients(
             self.model,
             max_norm=self.config.max_grad_norm,
         )
 
-        self.optimizer.step()
+        optimizer_step_succeeded = True
 
-        if self.scheduler is not None:
-            self.scheduler.step()
+        if self.scaler is not None:
+            old_scale = self.scaler.get_scale()
+
+            self.scaler.step(
+                self.optimizer
+            )
+
+            self.scaler.update()
+
+            new_scale = self.scaler.get_scale()
+
+            # A reduced scale indicates that the optimizer step
+            # was skipped because non-finite gradients were detected.
+            optimizer_step_succeeded = (
+                new_scale >= old_scale
+            )
+        else:
+            self.optimizer.step()
+
+        if optimizer_step_succeeded:
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            self.state.global_step += 1
 
         self.optimizer.zero_grad(
             set_to_none=True
         )
-
-        self.state.global_step += 1
 
         self.state.train_loss = (
             self._accumulated_loss
@@ -299,15 +650,20 @@ class Trainer:
             self.optimizer.param_groups[0]["lr"]
         )
 
+        self._micro_steps_since_update = 0
         self._accumulated_loss = 0.0
         self._accumulated_tokens = 0
-        self._micro_steps_since_update = 0
 
         self.state.elapsed_seconds = (
-            self.timer.elapsed()
+            self._elapsed_training_seconds()
         )
 
         self._sync_metrics()
+
+        # Do not trigger evaluation/checkpointing for a step that
+        # was skipped because of numerical overflow.
+        if not optimizer_step_succeeded:
+            return
 
         if (
             self.state.global_step
@@ -321,7 +677,9 @@ class Trainer:
             % self.config.eval_every_steps
             == 0
         ):
-            validation_loss = self.evaluate()
+            validation_loss = (
+                self.evaluate()
+            )
 
             self.state.validation_loss = (
                 validation_loss
@@ -337,8 +695,6 @@ class Trainer:
                     validation_loss
                 )
 
-            self._sync_metrics()
-
             self._save_checkpoint(
                 is_best=is_best
             )
@@ -352,56 +708,16 @@ class Trainer:
                 is_best=False
             )
 
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
+    def _flush_remaining_gradients(self) -> None:
+        """Apply a final partial gradient accumulation."""
 
-    @torch.no_grad()
-    def evaluate(self) -> float:
-        """Evaluate the model on the validation set."""
+        if (
+            self._micro_steps_since_update
+            == 0
+        ):
+            return
 
-        self.model.eval()
-
-        total_loss = 0.0
-        batch_count = 0
-
-        for batch in self.validation_loader:
-            inputs, targets = self._prepare_batch(
-                batch
-            )
-
-            model_output = self.model(inputs)
-            logits = (
-                model_output[0]
-                if isinstance(model_output, tuple)
-                else model_output
-            )
-
-            loss = self.loss_fn(
-                logits,
-                targets,
-            )
-
-            total_loss += float(
-                loss.item()
-            )
-
-            batch_count += 1
-
-            if (
-                self.config.max_eval_batches
-                is not None
-                and batch_count
-                >= self.config.max_eval_batches
-            ):
-                break
-
-        self.model.train()
-
-        if batch_count == 0:
-            return math.inf
-
-        return total_loss / batch_count
+        self._optimizer_step()
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -412,133 +728,266 @@ class Trainer:
         *,
         is_best: bool,
     ) -> None:
+        """Save complete training state."""
+
         self.state.elapsed_seconds = (
-            self.timer.elapsed()
+            self._elapsed_training_seconds()
         )
 
         self._sync_metrics()
+
+        dataloader_state = (
+            self._build_dataloader_state()
+        )
 
         self.checkpoint_manager.save(
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             epoch=self.state.epoch,
+            batch_in_epoch=(
+                self.state.batch_in_epoch
+            ),
             global_step=self.state.global_step,
             best_validation_loss=(
                 self.state.best_validation_loss
             ),
             metrics=self.metrics.to_dict(),
             is_best=is_best,
+            dataloader_state=dataloader_state,
         )
 
-    def resume(
+    def _build_dataloader_state(
         self,
-        *,
-        filename: str = "latest.pt",
-    ) -> TrainingState:
-        """Resume training from a checkpoint."""
+    ) -> dict[str, Any] | None:
+        """Build serializable DataLoader state."""
 
-        metadata = self.checkpoint_manager.load(
-            model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            filename=filename,
-            map_location=self.device,
+        if self.train_sampler is None:
+            return None
+
+        if not hasattr(
+            self.train_sampler,
+            "state_dict",
+        ):
+            return None
+
+        return {
+            "train_sampler": (
+                self.train_sampler.state_dict()
+            )
+        }
+
+    def _restore_dataloader_state(
+        self,
+        dataloader_state: Any,
+    ) -> None:
+        """Restore sampler state from checkpoint."""
+
+        if not isinstance(
+            dataloader_state,
+            dict,
+        ):
+            raise ValueError(
+                "dataloader_state must be a dictionary."
+            )
+
+        # An empty dictionary means the checkpoint was created
+        # without resumable DataLoader state. This is valid for
+        # trainers that do not use a custom resumable sampler.
+        if not dataloader_state:
+            return
+
+        sampler_state = dataloader_state.get(
+            "train_sampler"
         )
 
-        self.state.epoch = metadata[
-            "epoch"
-        ]
+        if sampler_state is None:
+            raise ValueError(
+                "dataloader_state is missing "
+                "'train_sampler'."
+            )
 
-        self.state.global_step = metadata[
-            "global_step"
-        ]
+        if self.train_sampler is None:
+            raise RuntimeError(
+                "Checkpoint contains sampler state, "
+                "but the current Trainer has no train sampler."
+            )
 
-        self.state.best_validation_loss = (
-            metadata["best_validation_loss"]
+        if not hasattr(
+            self.train_sampler,
+            "load_state_dict",
+        ):
+            raise RuntimeError(
+                "Current training sampler does not support "
+                "state restoration."
+            )
+
+        if not isinstance(
+            sampler_state,
+            dict,
+        ):
+            raise ValueError(
+                "train_sampler state must be a dictionary."
+            )
+
+        self.train_sampler.load_state_dict(
+            sampler_state
         )
 
-        checkpoint_metrics = metadata.get(
-            "metrics",
-            {},
+        self.state.epoch = int(
+            sampler_state["epoch"]
         )
 
-        self.state.train_loss = (
-            checkpoint_metrics.get(
-                "train_loss",
-                0.0,
+        self.state.batch_in_epoch = (
+            self._samples_to_batches(
+                int(
+                    sampler_state[
+                        "position"
+                    ]
+                )
             )
         )
 
-        self.state.validation_loss = (
-            checkpoint_metrics.get(
-                "validation_loss",
-                math.inf,
-            )
+    def _restore_sampler_position_fallback(
+        self,
+    ) -> None:
+        """Restore sampler position for older checkpoints."""
+
+        if self.train_sampler is None:
+            return
+
+        if not hasattr(
+            self.train_sampler,
+            "set_epoch",
+        ):
+            return
+
+        self.train_sampler.set_epoch(
+            self.state.epoch
         )
 
-        self.state.total_tokens = int(
-            checkpoint_metrics.get(
-                "total_tokens",
-                0,
+        if hasattr(
+            self.train_sampler,
+            "position",
+        ):
+            self.train_sampler.position = (
+                self._batches_to_samples(
+                    self.state.batch_in_epoch
+                )
             )
+
+    def _batches_to_samples(
+        self,
+        batch_count: int,
+    ) -> int:
+        """Convert processed batches into processed samples."""
+
+        batch_size = getattr(
+            self.train_loader,
+            "batch_size",
+            None,
         )
 
-        self.state.elapsed_seconds = float(
-            checkpoint_metrics.get(
-                "elapsed_seconds",
-                0.0,
+        if batch_size is None:
+            raise RuntimeError(
+                "Cannot determine batch size from train_loader."
             )
+
+        return (
+            batch_count
+            * int(batch_size)
         )
 
-        self.state.last_learning_rate = float(
-            checkpoint_metrics.get(
-                "learning_rate",
-                self.optimizer.param_groups[0][
-                    "lr"
-                ],
-            )
+    def _samples_to_batches(
+        self,
+        sample_count: int,
+    ) -> int:
+        """Convert processed samples into processed batches."""
+
+        batch_size = getattr(
+            self.train_loader,
+            "batch_size",
+            None,
         )
 
-        self.state.last_gradient_norm = float(
-            checkpoint_metrics.get(
-                "gradient_norm",
-                0.0,
+        if batch_size is None:
+            raise RuntimeError(
+                "Cannot determine batch size from train_loader."
             )
+
+        batch_size = int(
+            batch_size
         )
 
-        self._sync_metrics()
+        if sample_count == 0:
+            return 0
 
-        return self.state
+        return sample_count // batch_size
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Batch preparation
     # ------------------------------------------------------------------
 
     def _prepare_batch(
         self,
-        batch: tuple[Tensor, Tensor],
+        batch: Any,
     ) -> tuple[Tensor, Tensor]:
+        """Move a batch to the resolved runtime device."""
+
+        if not isinstance(
+            batch,
+            (tuple, list),
+        ):
+            raise TypeError(
+                "Expected batch to be a tuple or list "
+                "containing inputs and targets."
+            )
+
+        if len(batch) != 2:
+            raise ValueError(
+                "Expected batch to contain exactly "
+                "inputs and targets."
+            )
+
         inputs, targets = batch
 
-        if not isinstance(inputs, Tensor):
-            inputs = torch.as_tensor(inputs)
+        if not isinstance(
+            inputs,
+            Tensor,
+        ):
+            inputs = torch.as_tensor(
+                inputs,
+                dtype=torch.long,
+            )
 
-        if not isinstance(targets, Tensor):
-            targets = torch.as_tensor(targets)
+        if not isinstance(
+            targets,
+            Tensor,
+        ):
+            targets = torch.as_tensor(
+                targets,
+                dtype=torch.long,
+            )
 
-        return (
-            inputs.to(
-                self.device,
-                non_blocking=True,
-            ),
-            targets.to(
-                self.device,
-                non_blocking=True,
-            ),
+        inputs = inputs.to(
+            self.device,
+            non_blocking=True,
         )
 
+        targets = targets.to(
+            self.device,
+            non_blocking=True,
+        )
+
+        return inputs, targets
+
+    # ------------------------------------------------------------------
+    # Stopping
+    # ------------------------------------------------------------------
+
     def _should_stop(self) -> bool:
+        """Return whether maximum training steps were reached."""
+
         if self.config.max_steps is None:
             return False
 
@@ -547,7 +996,13 @@ class Trainer:
             >= self.config.max_steps
         )
 
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
     def _sync_metrics(self) -> None:
+        """Synchronize TrainingMetrics with TrainingState."""
+
         self.metrics.train_loss = (
             self.state.train_loss
         )
@@ -576,13 +1031,89 @@ class Trainer:
             self.state.elapsed_seconds
         )
 
+    def _restore_metrics(
+        self,
+        metrics: dict[str, Any],
+    ) -> None:
+        """Restore persisted metric values."""
+
+        self.state.train_loss = float(
+            metrics.get(
+                "train_loss",
+                self.state.train_loss,
+            )
+        )
+
+        self.state.validation_loss = float(
+            metrics.get(
+                "validation_loss",
+                self.state.validation_loss,
+            )
+        )
+
+        self.state.last_learning_rate = float(
+            metrics.get(
+                "learning_rate",
+                self.state.last_learning_rate,
+            )
+        )
+
+        self.state.last_gradient_norm = float(
+            metrics.get(
+                "gradient_norm",
+                self.state.last_gradient_norm,
+            )
+        )
+
+        self.state.total_tokens = int(
+            metrics.get(
+                "total_tokens",
+                metrics.get(
+                    "tokens",
+                    self.state.total_tokens,
+                ),
+            )
+        )
+
+        self.state.global_step = int(
+            metrics.get(
+                "global_step",
+                self.state.global_step,
+            )
+        )
+
+        self.state.elapsed_seconds = float(
+            metrics.get(
+                "elapsed_seconds",
+                self.state.elapsed_seconds,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Timing
+    # ------------------------------------------------------------------
+
+    def _elapsed_training_seconds(self) -> float:
+        """Return cumulative elapsed time across resumed runs."""
+
+        return (
+            self._timer_offset_seconds
+            + self.timer.elapsed()
+        )
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
     def _log_training_step(self) -> None:
+        """Print concise training progress."""
+
         print(
             f"step={self.state.global_step} "
-            f"loss={self.metrics.train_loss:.4f} "
-            f"ppl={self.metrics.train_perplexity:.2f} "
-            f"lr={self.metrics.learning_rate:.6e} "
-            f"grad_norm={self.metrics.gradient_norm:.4f} "
-            f"tokens={self.metrics.total_tokens:,} "
-            f"tokens/sec={self.metrics.tokens_per_second:.2f}"
+            f"epoch={self.state.epoch} "
+            f"batch={self.state.batch_in_epoch} "
+            f"train_loss={self.state.train_loss:.4f} "
+            f"val_loss={self.state.validation_loss:.4f} "
+            f"lr={self.state.last_learning_rate:.6g} "
+            f"tokens={self.state.total_tokens:,}"
         )

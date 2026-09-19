@@ -149,6 +149,7 @@ def main() -> None:
         / config.data.validation_file,
         sequence_length=config.sequence.length,
         config=data_loader_config,
+        seed=config.training.seed,
     )
 
     train_loader = data_module.train_dataloader()
@@ -234,6 +235,7 @@ def main() -> None:
         scheduler=scheduler,
         loss_fn=CausalLanguageModelLoss(),
         config=trainer_config,
+        train_sampler=data_module.train_sampler,
     )
 
     if resume:
