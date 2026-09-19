@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from src.model.block import TransformerBlock
 from src.model.cache import LayerKVCache
@@ -11,7 +14,29 @@ from src.model.norm import RMSNorm
 
 class MujahidReasonerModel(nn.Module):
     """
-    Decoder-only Transformer language model with optional KV caching.
+    Decoder-only Transformer language model.
+
+    Features:
+
+        - RMSNorm
+        - RoPE
+        - Grouped Query Attention
+        - SwiGLU
+        - Optional KV caching
+        - Optional gradient checkpointing
+
+    Gradient checkpointing is a training-time memory optimization.
+    When enabled, intermediate activations inside Transformer blocks
+    are not retained for backward. They are recomputed during the
+    backward pass.
+
+    KV caching and gradient checkpointing are intentionally separated:
+
+        Training:
+            gradient checkpointing may be enabled.
+
+        Inference:
+            KV caching is supported normally.
 
     Architecture:
 
@@ -31,23 +56,6 @@ class MujahidReasonerModel(nn.Module):
             │
             ▼
         Logits
-
-    Normal forward:
-        Input:
-            [batch, sequence_length]
-
-        Output:
-            [batch, sequence_length, vocab_size]
-
-    Cached forward:
-        Input:
-            New token(s) only
-
-        Cache:
-            Previous K/V states for every Transformer layer
-
-        Output:
-            Logits for new token(s) only
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -79,6 +87,13 @@ class MujahidReasonerModel(nn.Module):
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.token_embedding.weight
+
+        # Runtime training optimization.
+        #
+        # This is deliberately kept as model state rather than adding
+        # it to ModelConfig because gradient checkpointing is a runtime
+        # execution strategy, not an architectural property of the model.
+        self.gradient_checkpointing = False
 
         self.apply(self._initialize_weights)
 
@@ -114,6 +129,75 @@ class MujahidReasonerModel(nn.Module):
 
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
+
+    def enable_gradient_checkpointing(self) -> None:
+        """
+        Enable activation/gradient checkpointing.
+
+        When enabled, Transformer blocks are recomputed during the
+        backward pass instead of retaining all intermediate activations.
+
+        This reduces activation memory at the cost of additional
+        computation.
+
+        Checkpointing is only used during training and only when
+        KV caching is disabled.
+        """
+
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """
+        Disable activation/gradient checkpointing.
+        """
+
+        self.gradient_checkpointing = False
+
+    def is_gradient_checkpointing_enabled(self) -> bool:
+        """
+        Return whether gradient checkpointing is enabled.
+        """
+
+        return self.gradient_checkpointing
+
+    def _checkpoint_layer(
+        self,
+        layer: TransformerBlock,
+        x: Tensor,
+    ) -> Tensor:
+        """
+        Execute one Transformer block through activation checkpointing.
+
+        The checkpointed function returns only the hidden-state tensor.
+
+        KV-cache handling is deliberately excluded because cache
+        mutation is stateful and should never be replayed during
+        backward recomputation.
+        """
+
+        def forward_without_cache(
+            hidden_states: Tensor,
+        ) -> Tensor:
+            output, updated_cache = layer(
+                hidden_states,
+                position_offset=0,
+                cache=None,
+                use_cache=False,
+            )
+
+            if updated_cache is not None:
+                raise RuntimeError(
+                    "Gradient-checkpointed Transformer blocks "
+                    "must not produce a KV cache."
+                )
+
+            return output
+
+        return checkpoint(
+            forward_without_cache,
+            x,
+            use_reentrant=False,
+        )
 
     def forward(
         self,
@@ -217,6 +301,22 @@ class MujahidReasonerModel(nn.Module):
                         "position_offset."
                     )
 
+        # Gradient checkpointing is a training-only optimization.
+        #
+        # Never use it when:
+        #   - the model is in evaluation mode
+        #   - KV caching is requested
+        #   - an existing cache is being consumed
+        #
+        # This keeps autoregressive inference completely independent
+        # from the checkpointing mechanism.
+        use_gradient_checkpointing = (
+            self.training
+            and self.gradient_checkpointing
+            and not use_cache
+            and cache is None
+        )
+
         x = self.token_embedding(input_ids)
 
         updated_cache = None
@@ -232,6 +332,20 @@ class MujahidReasonerModel(nn.Module):
                 if cache is not None
                 else None
             )
+
+            if use_gradient_checkpointing:
+                if position_offset != 0:
+                    raise RuntimeError(
+                        "Gradient checkpointing currently requires "
+                        "position_offset=0."
+                    )
+
+                x = self._checkpoint_layer(
+                    layer,
+                    x,
+                )
+
+                continue
 
             x, layer_updated_cache = layer(
                 x,

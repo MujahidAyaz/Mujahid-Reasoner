@@ -27,6 +27,8 @@ class TrainerConfig:
     allow_tf32: bool = True
     cudnn_benchmark: bool = True
 
+    gradient_checkpointing: bool = False
+
     max_epochs: int = 1
     max_steps: int | None = None
 
@@ -127,6 +129,7 @@ class Trainer:
         - FP32/FP16/BF16 support
         - automatic mixed precision
         - CUDA GradScaler for FP16
+        - optional gradient checkpointing
         - true micro-batch gradient accumulation
         - correct partial accumulation handling
         - gradient clipping after normalization
@@ -155,6 +158,18 @@ class Trainer:
     The accumulated gradient is always the arithmetic mean of the
     micro-batch gradients. This remains correct when an epoch ends
     with a partial accumulation window.
+
+    Gradient checkpointing:
+
+        When enabled in TrainerConfig, the trainer activates the
+        model's gradient-checkpointing implementation when available.
+
+        Checkpointing is a training-time activation-memory optimization.
+        It is automatically inactive during evaluation because the model
+        is placed in evaluation mode.
+
+        KV caching remains independent from checkpointing and is not
+        used during training.
 
     Resume semantics:
 
@@ -194,6 +209,12 @@ class Trainer:
         self.model = model.to(
             self.device
         )
+
+        # --------------------------------------------------------------
+        # Gradient checkpointing
+        # --------------------------------------------------------------
+
+        self._configure_gradient_checkpointing()
 
         self.scaler = (
             self.runtime.create_grad_scaler()
@@ -480,6 +501,51 @@ class Trainer:
         )
 
         return validation_loss
+
+    # ------------------------------------------------------------------
+    # Runtime configuration
+    # ------------------------------------------------------------------
+
+    def _configure_gradient_checkpointing(
+        self,
+    ) -> None:
+        """
+        Configure model-level gradient checkpointing.
+
+        MujahidReasonerModel exposes explicit enable/disable methods.
+        The trainer uses duck typing so lightweight test models and
+        alternative model implementations remain compatible.
+
+        If checkpointing is requested but the model does not expose
+        the required API, fail immediately rather than silently
+        running a different experiment than requested.
+        """
+
+        enable = getattr(
+            self.model,
+            "enable_gradient_checkpointing",
+            None,
+        )
+
+        disable = getattr(
+            self.model,
+            "disable_gradient_checkpointing",
+            None,
+        )
+
+        if self.config.gradient_checkpointing:
+            if not callable(enable):
+                raise TypeError(
+                    "gradient_checkpointing=True requires the model "
+                    "to implement enable_gradient_checkpointing()."
+                )
+
+            enable()
+
+            return
+
+        if callable(disable):
+            disable()
 
     # ------------------------------------------------------------------
     # Epoch handling

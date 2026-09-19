@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.model.model import MujahidReasonerModel
 from src.model.cache import LayerKVCache
 from src.model.config import ModelConfig
+from src.model.model import MujahidReasonerModel
 
 
 @pytest.fixture
@@ -492,3 +492,331 @@ def test_cache_rejects_wrong_position(
             cache=cache,
             use_cache=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Gradient Checkpointing Tests
+# ---------------------------------------------------------------------------
+
+
+def test_gradient_checkpointing_state(
+    model: MujahidReasonerModel,
+) -> None:
+    assert not model.is_gradient_checkpointing_enabled()
+
+    model.enable_gradient_checkpointing()
+
+    assert model.is_gradient_checkpointing_enabled()
+
+    model.disable_gradient_checkpointing()
+
+    assert not model.is_gradient_checkpointing_enabled()
+
+
+def test_gradient_checkpointing_output_equivalence(
+    config: ModelConfig,
+) -> None:
+    """
+    Gradient checkpointing must not change the forward result.
+    """
+
+    torch.manual_seed(123)
+
+    model_normal = MujahidReasonerModel(config)
+
+    torch.manual_seed(123)
+
+    model_checkpointed = MujahidReasonerModel(config)
+
+    model_normal.train()
+    model_checkpointed.train()
+
+    model_checkpointed.enable_gradient_checkpointing()
+
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    normal_logits, normal_cache = model_normal(
+        input_ids,
+        use_cache=False,
+    )
+
+    checkpointed_logits, checkpointed_cache = (
+        model_checkpointed(
+            input_ids,
+            use_cache=False,
+        )
+    )
+
+    assert normal_cache is None
+    assert checkpointed_cache is None
+
+    assert torch.allclose(
+        normal_logits,
+        checkpointed_logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_gradient_checkpointing_backward(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    Verify gradients propagate through checkpointed layers.
+    """
+
+    model.train()
+    model.enable_gradient_checkpointing()
+
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    logits, cache = model(
+        input_ids,
+        use_cache=False,
+    )
+
+    loss = logits.mean()
+
+    loss.backward()
+
+    assert cache is None
+
+    embedding_gradient = (
+        model.token_embedding.weight.grad
+    )
+
+    assert embedding_gradient is not None
+
+    assert torch.isfinite(
+        embedding_gradient
+    ).all()
+
+    assert (
+        embedding_gradient.abs().sum().item()
+        > 0.0
+    )
+
+
+def test_gradient_checkpointing_is_training_only(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    Verify the externally observable training/evaluation behavior.
+
+    Training with checkpointing must produce valid gradients.
+    Evaluation with checkpointing enabled must still produce
+    valid inference output without requiring gradients.
+    """
+
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    model.train()
+    model.enable_gradient_checkpointing()
+
+    train_logits, train_cache = model(
+        input_ids,
+        use_cache=False,
+    )
+
+    assert train_logits.shape == (
+        2,
+        8,
+        32000,
+    )
+
+    assert train_cache is None
+    assert train_logits.requires_grad
+
+    train_loss = train_logits.mean()
+    train_loss.backward()
+
+    assert (
+        model.token_embedding.weight.grad
+        is not None
+    )
+
+    model.zero_grad(set_to_none=True)
+
+    model.eval()
+
+    with torch.no_grad():
+        eval_logits, eval_cache = model(
+            input_ids,
+            use_cache=False,
+        )
+
+    assert eval_logits.shape == (
+        2,
+        8,
+        32000,
+    )
+
+    assert eval_cache is None
+    assert not eval_logits.requires_grad
+
+    assert torch.isfinite(eval_logits).all()
+
+
+def test_gradient_checkpointing_with_kv_cache(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    Enabling gradient checkpointing must not break KV-cache
+    inference.
+    """
+
+    model.train()
+    model.enable_gradient_checkpointing()
+
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    logits, cache = model(
+        input_ids,
+        use_cache=True,
+    )
+
+    assert logits.shape == (
+        2,
+        8,
+        32000,
+    )
+
+    assert isinstance(
+        cache,
+        LayerKVCache,
+    )
+
+    assert len(cache) == 6
+
+    for layer_cache in cache.layers:
+        assert layer_cache is not None
+        assert layer_cache.sequence_length == 8
+
+
+def test_gradient_checkpointing_cache_growth(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    KV-cache continuation must remain functional when
+    checkpointing is enabled.
+    """
+
+    model.train()
+    model.enable_gradient_checkpointing()
+
+    prompt = torch.randint(
+        0,
+        32000,
+        (1, 4),
+    )
+
+    continuation = torch.randint(
+        0,
+        32000,
+        (1, 1),
+    )
+
+    _, cache = model(
+        prompt,
+        use_cache=True,
+    )
+
+    assert cache is not None
+
+    _, updated_cache = model(
+        continuation,
+        position_offset=4,
+        cache=cache,
+        use_cache=True,
+    )
+
+    assert updated_cache is not None
+
+    for layer_cache in updated_cache.layers:
+        assert layer_cache is not None
+        assert layer_cache.sequence_length == 5
+
+
+def test_gradient_checkpointing_position_offset_restriction(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    Checkpointed training currently operates only from
+    position offset zero.
+    """
+
+    model.train()
+    model.enable_gradient_checkpointing()
+
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="position_offset=0",
+    ):
+        model(
+            input_ids,
+            position_offset=1,
+            use_cache=False,
+        )
+
+
+def test_gradient_checkpointing_can_be_disabled_after_training(
+    model: MujahidReasonerModel,
+) -> None:
+    """
+    Disabling checkpointing must restore the normal path.
+    """
+
+    model.train()
+
+    input_ids = torch.randint(
+        0,
+        32000,
+        (2, 8),
+    )
+
+    model.enable_gradient_checkpointing()
+
+    checkpointed_logits, checkpointed_cache = model(
+        input_ids,
+        use_cache=False,
+    )
+
+    assert checkpointed_cache is None
+
+    model.disable_gradient_checkpointing()
+
+    normal_logits, normal_cache = model(
+        input_ids,
+        use_cache=False,
+    )
+
+    assert normal_cache is None
+
+    assert torch.allclose(
+        checkpointed_logits,
+        normal_logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
