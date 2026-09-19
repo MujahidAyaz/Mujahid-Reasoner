@@ -4,6 +4,12 @@ import pytest
 import torch
 
 from src.inference.generator import GenerationConfig, TextGenerator
+from src.inference.sampling import (
+    apply_frequency_presence_penalties,
+    apply_repetition_penalty,
+    sample_token,
+)
+
 
 
 class DummyTokenizer:
@@ -218,7 +224,7 @@ def test_greedy_decoding_selects_highest_logit():
         do_sample=False,
     )
 
-    result = TextGenerator._sample_token(
+    result = sample_token(
         logits,
         config,
     )
@@ -260,7 +266,7 @@ def test_repetition_penalty_reduces_positive_logit():
         [[2.0, 5.0, 3.0, 1.0]]
     )
 
-    result = TextGenerator._apply_repetition_penalty(
+    result = apply_repetition_penalty(
         logits,
         generated_ids=[1, 2],
         penalty=2.0,
@@ -277,7 +283,7 @@ def test_repetition_penalty_preserves_logits_at_one():
         [[2.0, -4.0, 3.0, 1.0]]
     )
 
-    result = TextGenerator._apply_repetition_penalty(
+    result = apply_repetition_penalty(
         logits,
         generated_ids=[0, 1, 2],
         penalty=1.0,
@@ -300,7 +306,7 @@ def test_frequency_penalty():
         [[5.0, 4.0, 3.0, 2.0]]
     )
 
-    result = TextGenerator._apply_frequency_presence_penalties(
+    result = apply_frequency_presence_penalties(
         logits,
         generated_ids=[1, 1, 2],
         frequency_penalty=1.0,
@@ -318,7 +324,7 @@ def test_presence_penalty():
         [[5.0, 4.0, 3.0, 2.0]]
     )
 
-    result = TextGenerator._apply_frequency_presence_penalties(
+    result = apply_frequency_presence_penalties(
         logits,
         generated_ids=[1, 1, 2],
         frequency_penalty=0.0,
@@ -336,7 +342,7 @@ def test_frequency_and_presence_penalty():
         [[5.0, 4.0, 3.0, 2.0]]
     )
 
-    result = TextGenerator._apply_frequency_presence_penalties(
+    result = apply_frequency_presence_penalties(
         logits,
         generated_ids=[1, 1, 2],
         frequency_penalty=0.5,
@@ -354,7 +360,7 @@ def test_frequency_presence_penalties_zero():
         [[5.0, 4.0, 3.0, 2.0]]
     )
 
-    result = TextGenerator._apply_frequency_presence_penalties(
+    result = apply_frequency_presence_penalties(
         logits,
         generated_ids=[1, 2],
         frequency_penalty=0.0,
@@ -516,7 +522,7 @@ def test_special_token_suppression_blocks_pad_and_bos():
 
     config = GenerationConfig(do_sample=False)
 
-    next_token = TextGenerator._sample_token(
+    next_token = sample_token(
         logits,
         config,
         forbidden_token_ids=(0, 1),
@@ -533,7 +539,7 @@ def test_special_token_suppression_allows_eos():
 
     config = GenerationConfig(do_sample=False)
 
-    next_token = TextGenerator._sample_token(
+    next_token = sample_token(
         logits,
         config,
         forbidden_token_ids=(0, 1),
@@ -550,7 +556,7 @@ def test_special_token_suppression_allows_unk():
 
     config = GenerationConfig(do_sample=False)
 
-    next_token = TextGenerator._sample_token(
+    next_token = sample_token(
         logits,
         config,
         forbidden_token_ids=(0, 1),
@@ -569,7 +575,7 @@ def test_special_token_suppression_does_not_mutate_logits():
 
     config = GenerationConfig(do_sample=False)
 
-    TextGenerator._sample_token(
+    sample_token(
         logits,
         config,
         forbidden_token_ids=(0, 1),
@@ -586,7 +592,7 @@ def test_special_token_suppression_handles_invalid_ids():
 
     config = GenerationConfig(do_sample=False)
 
-    next_token = TextGenerator._sample_token(
+    next_token = sample_token(
         logits,
         config,
         forbidden_token_ids=(-1, 99),
@@ -610,7 +616,7 @@ def test_special_token_suppression_works_with_sampling():
 
     torch.manual_seed(42)
 
-    next_token = TextGenerator._sample_token(
+    next_token = sample_token(
         logits,
         config,
         forbidden_token_ids=(0, 1),

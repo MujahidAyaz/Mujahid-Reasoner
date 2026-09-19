@@ -11,18 +11,8 @@ from src.model.cache import LayerKVCache
 from src.model.model import MujahidReasonerModel
 
 
-@dataclass(frozen=True)
-class GenerationConfig:
-    min_new_tokens: int = 0
-    max_new_tokens: int = 100
-    temperature: float = 0.8
-    top_k: int = 50
-    top_p: float = 0.9
-    do_sample: bool = True
-    repetition_penalty: float = 1.0
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
-    stop_sequences: tuple[str, ...] = ()
+from src.inference.config import GenerationConfig
+from src.inference.sampling import sample_token
 
 
 class TextGenerator:
@@ -214,7 +204,7 @@ class TextGenerator:
             if self._cache_is_full(cache):
                 break
 
-            next_token = self._sample_token(
+            next_token = sample_token(
                 next_logits,
                 config,
                 generated_ids=generated_ids,
@@ -314,7 +304,7 @@ class TextGenerator:
             if self._cache_is_full(cache):
                 break
 
-            next_token = self._sample_token(
+            next_token = sample_token(
                 next_logits,
                 config,
                 generated_ids=generated_ids,
@@ -433,7 +423,7 @@ class TextGenerator:
 
             next_logits = logits[:, -1, :]
 
-            next_token = self._sample_token(
+            next_token = sample_token(
                 next_logits,
                 config,
                 generated_ids=generated_ids,
@@ -519,7 +509,7 @@ class TextGenerator:
 
             next_logits = logits[:, -1, :]
 
-            next_token = self._sample_token(
+            next_token = sample_token(
                 next_logits,
                 config,
                 generated_ids=generated_ids,
@@ -766,123 +756,6 @@ class TextGenerator:
 
 
     @staticmethod
-    def _sample_token(
-        logits: Tensor,
-        config: GenerationConfig,
-        generated_ids: list[int] | None = None,
-        forbidden_token_ids: tuple[int, ...] = (),
-    ) -> Tensor:
-        """
-        Select the next token using either greedy decoding or sampling.
-        """
-
-        if logits.ndim != 2:
-            raise ValueError(
-                "Logits must have shape [batch, vocab_size]."
-            )
-
-        if forbidden_token_ids:
-            logits = logits.clone()
-
-            for token_id in forbidden_token_ids:
-                if 0 <= token_id < logits.size(-1):
-                    logits[:, token_id] = float("-inf")
-
-        if not config.do_sample:
-            return torch.argmax(
-                logits,
-                dim=-1,
-                keepdim=True,
-            )
-
-        logits = logits / config.temperature
-
-        if config.repetition_penalty > 1.0:
-            logits = TextGenerator._apply_repetition_penalty(
-                logits,
-                generated_ids,
-                config.repetition_penalty,
-            )
-
-        if (
-            config.frequency_penalty > 0.0
-            or config.presence_penalty > 0.0
-        ):
-            logits = (
-                TextGenerator
-                ._apply_frequency_presence_penalties(
-                    logits,
-                    generated_ids,
-                    config.frequency_penalty,
-                    config.presence_penalty,
-                )
-            )
-
-        if config.top_k > 0:
-            logits = TextGenerator._apply_top_k(
-                logits,
-                config.top_k,
-            )
-
-        if config.top_p < 1.0:
-            logits = TextGenerator._apply_top_p(
-                logits,
-                config.top_p,
-            )
-
-        probabilities = torch.softmax(
-            logits,
-            dim=-1,
-        )
-
-        return torch.multinomial(
-            probabilities,
-            num_samples=1,
-        )
-
-    @staticmethod
-    def _apply_repetition_penalty(
-        logits: Tensor,
-        generated_ids: list[int] | None,
-        penalty: float,
-    ) -> Tensor:
-        """
-        Penalize tokens that have already appeared.
-
-        Positive logits are divided by the penalty.
-        Negative logits are multiplied by the penalty.
-
-        A penalty of 1.0 leaves logits unchanged.
-        """
-
-        if penalty < 1.0:
-            raise ValueError(
-                "repetition_penalty must be greater than or equal to 1.0."
-            )
-
-        if not generated_ids:
-            return logits
-
-        penalized_logits = logits.clone()
-
-        token_ids = torch.tensor(
-            list(set(generated_ids)),
-            dtype=torch.long,
-            device=logits.device,
-        )
-
-        selected_logits = penalized_logits[:, token_ids]
-
-        selected_logits = torch.where(
-            selected_logits > 0,
-            selected_logits / penalty,
-            selected_logits * penalty,
-        )
-
-        penalized_logits[:, token_ids] = selected_logits
-
-        return penalized_logits
-
     def _suppress_special_tokens(
     self,
     logits: torch.Tensor,
@@ -897,75 +770,6 @@ class TextGenerator:
         return logits
 
     @staticmethod
-    def _apply_frequency_presence_penalties(
-        logits: Tensor,
-        generated_ids: list[int] | None,
-        frequency_penalty: float,
-        presence_penalty: float,
-    ) -> Tensor:
-        """
-        Apply frequency and presence penalties.
-
-        Frequency penalty:
-            Penalizes tokens proportionally to how many times
-            they have already appeared.
-
-        Presence penalty:
-            Applies a fixed penalty to every token that has
-            appeared at least once.
-
-        Formula:
-            adjusted_logit =
-                logit
-                - frequency_penalty * count(token)
-                - presence_penalty * I(token appeared)
-        """
-
-        if frequency_penalty < 0.0:
-            raise ValueError(
-                "frequency_penalty must be greater than or equal to 0.0."
-            )
-
-        if presence_penalty < 0.0:
-            raise ValueError(
-                "presence_penalty must be greater than or equal to 0.0."
-            )
-
-        if not generated_ids:
-            return logits
-
-        if (
-            frequency_penalty == 0.0
-            and presence_penalty == 0.0
-        ):
-            return logits
-
-        penalized_logits = logits.clone()
-
-        token_ids = torch.tensor(
-            generated_ids,
-            dtype=torch.long,
-            device=logits.device,
-        )
-
-        counts = torch.bincount(
-            token_ids,
-            minlength=logits.size(-1),
-        ).to(logits.dtype)
-
-        penalty = (
-            frequency_penalty * counts
-            + presence_penalty
-            * (counts > 0).to(logits.dtype)
-        )
-
-        penalized_logits = (
-            penalized_logits
-            - penalty.unsqueeze(0)
-        )
-
-        return penalized_logits
-
     @staticmethod
     def _apply_top_k(
         logits: Tensor,
