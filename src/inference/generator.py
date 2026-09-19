@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 from tokenizers import Tokenizer
 
+from src.inference.batching import (
+    BatchGenerationOutput,
+    group_prompt_indices_by_length,
+)
+from src.inference.config import GenerationConfig
+from src.inference.sampling import (
+    apply_top_k,
+    apply_top_p,
+    sample_token,
+)
 from src.model.cache import LayerKVCache
 from src.model.model import MujahidReasonerModel
-
-
-from src.inference.config import GenerationConfig
-from src.inference.sampling import sample_token
 
 
 class TextGenerator:
@@ -22,6 +27,7 @@ class TextGenerator:
     Supports:
 
     - Standard full-text generation.
+    - Batched generation.
     - Incremental streaming generation.
     - Preallocated KV-cache decoding.
     - Greedy decoding.
@@ -35,8 +41,7 @@ class TextGenerator:
     - Minimum generation length.
     - Maximum generation length.
 
-    The existing `generate()` API is preserved so current
-    callers remain compatible.
+    The existing `generate()` API is preserved.
     """
 
     def __init__(
@@ -72,12 +77,7 @@ class TextGenerator:
         config: GenerationConfig | None = None,
         use_cache: bool = True,
     ) -> str:
-        """
-        Generate complete text from a prompt.
-
-        Returns:
-            Generated text including the original prompt.
-        """
+        """Generate complete text from a prompt."""
 
         self._validate_prompt(prompt)
 
@@ -119,10 +119,290 @@ class TextGenerator:
         )
 
     # ------------------------------------------------------------------
-    # Streaming generation API
+    # Batched generation API
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
+    def generate_batch(
+        self,
+        prompts: tuple[str, ...],
+        config: GenerationConfig | None = None,
+    ) -> BatchGenerationOutput:
+        """
+        Generate text for multiple prompts.
+
+        Prompts are grouped by tokenized length so each group can safely
+        share the current KV-cache implementation.
+        """
+
+        if not prompts:
+            raise ValueError(
+                "prompts must not be empty."
+            )
+
+        if not all(
+            isinstance(prompt, str)
+            for prompt in prompts
+        ):
+            raise ValueError(
+                "all prompts must be strings."
+            )
+
+        if not all(
+            prompt.strip()
+            for prompt in prompts
+        ):
+            raise ValueError(
+                "all prompts must be non-empty."
+            )
+
+        config = config or GenerationConfig()
+
+        self._validate_generation_config(config)
+
+        encoded_prompts = [
+            self.tokenizer.encode(prompt).ids
+            for prompt in prompts
+        ]
+
+        if not all(encoded_prompts):
+            raise ValueError(
+                "all prompts must tokenize to at least one token."
+            )
+
+        encoded_prompts = [
+            self._truncate_prompt(token_ids)
+            for token_ids in encoded_prompts
+        ]
+
+        groups = group_prompt_indices_by_length(
+            encoded_prompts,
+        )
+
+        results: list[str | None] = [
+            None
+        ] * len(prompts)
+
+        for indices in groups.values():
+            batch_input_ids = torch.tensor(
+                [
+                    encoded_prompts[index]
+                    for index in indices
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            generated_ids = self._generate_batch_with_cache(
+                batch_input_ids,
+                config,
+            )
+
+            for row, original_index in enumerate(indices):
+                results[original_index] = (
+                    self.tokenizer.decode(
+                        generated_ids[row],
+                        skip_special_tokens=True,
+                    )
+                )
+
+        if any(
+            result is None
+            for result in results
+        ):
+            raise RuntimeError(
+                "Batched generation failed to produce "
+                "all outputs."
+            )
+
+        return BatchGenerationOutput(
+            texts=tuple(results),
+        )
+
+    def _generate_batch_with_cache(
+        self,
+        input_ids: Tensor,
+        config: GenerationConfig,
+    ) -> list[list[int]]:
+        """
+        Autoregressively generate multiple sequences in parallel.
+
+        All rows must have the same prompt length.
+
+        Finished rows receive EOS internally so the shared KV cache
+        remains synchronized.
+        """
+
+        if input_ids.ndim != 2:
+            raise ValueError(
+                "input_ids must have shape "
+                "[batch, sequence_length]."
+            )
+
+        batch_size = input_ids.size(0)
+
+        if batch_size == 0:
+            raise ValueError(
+                "input_ids batch must not be empty."
+            )
+
+        generated_ids = [
+            row.tolist()
+            for row in input_ids
+        ]
+
+        prompt_length = input_ids.size(1)
+
+        logits, cache = self.model(
+            input_ids,
+            use_cache=True,
+        )
+
+        if cache is None:
+            raise RuntimeError(
+                "Model did not return a KV cache."
+            )
+
+        next_logits = logits[:, -1, :]
+
+        finished = [
+            False
+        ] * batch_size
+
+        generated_token_counts = [
+            0
+        ] * batch_size
+
+        forbidden_token_ids = (
+            self._get_forbidden_token_ids()
+        )
+
+        for _ in range(
+            config.max_new_tokens
+        ):
+            if self._cache_is_full(cache):
+                break
+
+            active_indices = [
+                index
+                for index, is_finished in enumerate(
+                    finished
+                )
+                if not is_finished
+            ]
+
+            next_tokens = torch.full(
+                (batch_size, 1),
+                self.eos_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            if active_indices:
+                active_logits = next_logits[
+                    active_indices
+                ]
+
+                active_histories = [
+                    generated_ids[index]
+                    for index in active_indices
+                ]
+
+                sampled_tokens = sample_token(
+                    active_logits,
+                    config,
+                    generated_ids=active_histories,
+                    forbidden_token_ids=(
+                        forbidden_token_ids
+                    ),
+                )
+
+                for row, batch_index in enumerate(
+                    active_indices
+                ):
+                    next_tokens[
+                        batch_index,
+                        0,
+                    ] = sampled_tokens[
+                        row,
+                        0,
+                    ]
+
+            for index in range(batch_size):
+                if finished[index]:
+                    continue
+
+                token_id = int(
+                    next_tokens[
+                        index,
+                        0,
+                    ].item()
+                )
+
+                generated_ids[index].append(
+                    token_id
+                )
+
+                generated_token_counts[index] += 1
+
+                generated_text = (
+                    self.tokenizer.decode(
+                        generated_ids[index][
+                            prompt_length:
+                        ],
+                        skip_special_tokens=True,
+                    )
+                )
+
+                can_stop = self._can_stop(
+                    generated_token_counts[index],
+                    config.min_new_tokens,
+                )
+
+                if (
+                    can_stop
+                    and self._contains_stop_sequence(
+                        generated_text,
+                        config.stop_sequences,
+                    )
+                ):
+                    finished[index] = True
+
+                if (
+                    token_id == self.eos_token_id
+                    and can_stop
+                ):
+                    finished[index] = True
+
+            if all(finished):
+                break
+
+            position_offset = self._get_cache_length(
+                cache,
+                fallback=input_ids.size(1),
+            )
+
+            logits, cache = self.model(
+                next_tokens,
+                position_offset=position_offset,
+                cache=cache,
+                use_cache=True,
+            )
+
+            if cache is None:
+                raise RuntimeError(
+                    "Model stopped returning "
+                    "the KV cache."
+                )
+
+            next_logits = logits[:, -1, :]
+
+        return generated_ids
+
+    # ------------------------------------------------------------------
+    # Streaming generation API
+    # ------------------------------------------------------------------
+
     def generate_stream(
         self,
         prompt: str,
@@ -136,8 +416,7 @@ class TextGenerator:
 
         The original prompt is not yielded.
 
-        Partial stop-sequence prefixes are buffered internally so
-        they are never leaked to the caller.
+        Partial stop-sequence prefixes are buffered internally.
         """
 
         self._validate_prompt(prompt)
@@ -200,7 +479,9 @@ class TextGenerator:
 
         next_logits = logits[:, -1, :]
 
-        for _ in range(config.max_new_tokens):
+        for _ in range(
+            config.max_new_tokens
+        ):
             if self._cache_is_full(cache):
                 break
 
@@ -208,20 +489,31 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
-                forbidden_token_ids=self._get_forbidden_token_ids(),
+                forbidden_token_ids=(
+                    self._get_forbidden_token_ids()
+                ),
             )
 
-            token_id = int(next_token.item())
+            token_id = int(
+                next_token.item()
+            )
 
-            generated_ids.append(token_id)
+            generated_ids.append(
+                token_id
+            )
 
             generated_token_count = (
-                len(generated_ids) - prompt_length
+                len(generated_ids)
+                - prompt_length
             )
 
-            current_text = self.tokenizer.decode(
-                generated_ids[prompt_length:],
-                skip_special_tokens=True,
+            current_text = (
+                self.tokenizer.decode(
+                    generated_ids[
+                        prompt_length:
+                    ],
+                    skip_special_tokens=True,
+                )
             )
 
             can_stop = self._can_stop(
@@ -244,12 +536,17 @@ class TextGenerator:
             ):
                 break
 
-            position_offset = self._get_cache_length(
-                cache,
-                fallback=len(generated_ids) - 1,
+            position_offset = (
+                self._get_cache_length(
+                    cache,
+                    fallback=len(generated_ids) - 1,
+                )
             )
 
-            next_input = next_token.view(1, 1)
+            next_input = next_token.view(
+                1,
+                1,
+            )
 
             logits, cache = self.model(
                 next_input,
@@ -260,7 +557,8 @@ class TextGenerator:
 
             if cache is None:
                 raise RuntimeError(
-                    "Model stopped returning the KV cache."
+                    "Model stopped returning "
+                    "the KV cache."
                 )
 
             next_logits = logits[:, -1, :]
@@ -276,12 +574,7 @@ class TextGenerator:
         input_ids: Tensor,
         config: GenerationConfig,
     ) -> Iterator[str]:
-        """
-        Stream generation using incremental KV-cache decoding.
-
-        Stop-sequence prefixes are buffered until they can be
-        determined to be safe text or a complete stop sequence.
-        """
+        """Stream generation using incremental KV-cache decoding."""
 
         logits, cache = self.model(
             input_ids,
@@ -300,7 +593,9 @@ class TextGenerator:
 
         emitted_text = ""
 
-        for _ in range(config.max_new_tokens):
+        for _ in range(
+            config.max_new_tokens
+        ):
             if self._cache_is_full(cache):
                 break
 
@@ -308,19 +603,31 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
+                forbidden_token_ids=(
+                    self._get_forbidden_token_ids()
+                ),
             )
 
-            token_id = int(next_token.item())
+            token_id = int(
+                next_token.item()
+            )
 
-            generated_ids.append(token_id)
+            generated_ids.append(
+                token_id
+            )
 
             generated_token_count = (
-                len(generated_ids) - prompt_length
+                len(generated_ids)
+                - prompt_length
             )
 
-            current_text = self.tokenizer.decode(
-                generated_ids[prompt_length:],
-                skip_special_tokens=True,
+            current_text = (
+                self.tokenizer.decode(
+                    generated_ids[
+                        prompt_length:
+                    ],
+                    skip_special_tokens=True,
+                )
             )
 
             can_stop = self._can_stop(
@@ -329,17 +636,20 @@ class TextGenerator:
             )
 
             if can_stop:
-                safe_text, should_stop = (
-                    self._get_safe_stream_text(
-                        current_text,
-                        config.stop_sequences,
-                    )
+                (
+                    safe_text,
+                    should_stop,
+                ) = self._get_safe_stream_text(
+                    current_text,
+                    config.stop_sequences,
                 )
             else:
                 safe_text = current_text
                 should_stop = False
 
-            chunk = safe_text[len(emitted_text):]
+            chunk = safe_text[
+                len(emitted_text):
+            ]
 
             if chunk:
                 yield chunk
@@ -355,16 +665,21 @@ class TextGenerator:
             ):
                 break
 
-            position_offset = self._get_cache_length(
-                cache,
-                fallback=(
-                    len(input_ids[0])
-                    + generated_token_count
-                    - 1
-                ),
+            position_offset = (
+                self._get_cache_length(
+                    cache,
+                    fallback=(
+                        len(input_ids[0])
+                        + generated_token_count
+                        - 1
+                    ),
+                )
             )
 
-            next_input = next_token.view(1, 1)
+            next_input = next_token.view(
+                1,
+                1,
+            )
 
             logits, cache = self.model(
                 next_input,
@@ -375,7 +690,8 @@ class TextGenerator:
 
             if cache is None:
                 raise RuntimeError(
-                    "Model stopped returning the KV cache."
+                    "Model stopped returning "
+                    "the KV cache."
                 )
 
             next_logits = logits[:, -1, :]
@@ -392,14 +708,16 @@ class TextGenerator:
         """
         Generate without KV caching.
 
-        This path is retained as a correctness and benchmarking
+        Retained as a correctness and benchmarking
         reference implementation.
         """
 
         generated_ids = input_ids[0].tolist()
         prompt_length = len(generated_ids)
 
-        for _ in range(config.max_new_tokens):
+        for _ in range(
+            config.max_new_tokens
+        ):
             context_ids = generated_ids[
                 -self.model.config.max_sequence_length:
             ]
@@ -417,7 +735,10 @@ class TextGenerator:
 
             logits = (
                 model_output[0]
-                if isinstance(model_output, tuple)
+                if isinstance(
+                    model_output,
+                    tuple,
+                )
                 else model_output
             )
 
@@ -427,19 +748,31 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
+                forbidden_token_ids=(
+                    self._get_forbidden_token_ids()
+                ),
             )
 
-            token_id = int(next_token.item())
+            token_id = int(
+                next_token.item()
+            )
 
-            generated_ids.append(token_id)
+            generated_ids.append(
+                token_id
+            )
 
             generated_token_count = (
-                len(generated_ids) - prompt_length
+                len(generated_ids)
+                - prompt_length
             )
 
-            current_text = self.tokenizer.decode(
-                generated_ids[prompt_length:],
-                skip_special_tokens=True,
+            current_text = (
+                self.tokenizer.decode(
+                    generated_ids[
+                        prompt_length:
+                    ],
+                    skip_special_tokens=True,
+                )
             )
 
             can_stop = self._can_stop(
@@ -473,19 +806,16 @@ class TextGenerator:
         input_ids: Tensor,
         config: GenerationConfig,
     ) -> Iterator[str]:
-        """
-        Stream generation without KV caching.
-
-        This path exists primarily for correctness testing and
-        benchmarking. Cached streaming should be preferred.
-        """
+        """Stream generation without KV caching."""
 
         generated_ids = input_ids[0].tolist()
         prompt_length = len(generated_ids)
 
         emitted_text = ""
 
-        for _ in range(config.max_new_tokens):
+        for _ in range(
+            config.max_new_tokens
+        ):
             context_ids = generated_ids[
                 -self.model.config.max_sequence_length:
             ]
@@ -503,7 +833,10 @@ class TextGenerator:
 
             logits = (
                 model_output[0]
-                if isinstance(model_output, tuple)
+                if isinstance(
+                    model_output,
+                    tuple,
+                )
                 else model_output
             )
 
@@ -513,19 +846,31 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
+                forbidden_token_ids=(
+                    self._get_forbidden_token_ids()
+                ),
             )
 
-            token_id = int(next_token.item())
+            token_id = int(
+                next_token.item()
+            )
 
-            generated_ids.append(token_id)
+            generated_ids.append(
+                token_id
+            )
 
             generated_token_count = (
-                len(generated_ids) - prompt_length
+                len(generated_ids)
+                - prompt_length
             )
 
-            generated_text = self.tokenizer.decode(
-                generated_ids[prompt_length:],
-                skip_special_tokens=True,
+            generated_text = (
+                self.tokenizer.decode(
+                    generated_ids[
+                        prompt_length:
+                    ],
+                    skip_special_tokens=True,
+                )
             )
 
             can_stop = self._can_stop(
@@ -534,17 +879,20 @@ class TextGenerator:
             )
 
             if can_stop:
-                safe_text, should_stop = (
-                    self._get_safe_stream_text(
-                        generated_text,
-                        config.stop_sequences,
-                    )
+                (
+                    safe_text,
+                    should_stop,
+                ) = self._get_safe_stream_text(
+                    generated_text,
+                    config.stop_sequences,
                 )
             else:
                 safe_text = generated_text
                 should_stop = False
 
-            chunk = safe_text[len(emitted_text):]
+            chunk = safe_text[
+                len(emitted_text):
+            ]
 
             if chunk:
                 yield chunk
@@ -569,23 +917,11 @@ class TextGenerator:
         text: str,
         stop_sequences: tuple[str, ...],
     ) -> tuple[str, bool]:
-        """
-        Return text that is safe to stream.
-
-        A suffix that could still become a stop sequence is held
-        back until enough text arrives to determine its meaning.
-
-        Returns:
-            Tuple containing:
-
-            - safe text that may be emitted
-            - whether a complete stop sequence was found
-        """
+        """Return text that is safe to stream."""
 
         if not stop_sequences:
             return text, False
 
-        # First check for a complete stop sequence.
         earliest_stop_index: int | None = None
 
         for sequence in stop_sequences:
@@ -606,10 +942,6 @@ class TextGenerator:
                 True,
             )
 
-        # No complete stop sequence exists yet.
-        #
-        # Hold back the longest suffix that is also a prefix
-        # of a configured stop sequence.
         max_pending_length = 0
 
         for sequence in stop_sequences:
@@ -623,7 +955,9 @@ class TextGenerator:
                 0,
                 -1,
             ):
-                if text.endswith(sequence[:length]):
+                if text.endswith(
+                    sequence[:length]
+                ):
                     max_pending_length = max(
                         max_pending_length,
                         length,
@@ -650,60 +984,41 @@ class TextGenerator:
             for sequence in stop_sequences
         )
 
-    @staticmethod
-    def _decode_generated_chunk(
-        self,
-        generated_ids: list[int],
-        previous_text: str = "",
-    ) -> tuple[str, str]:
-        """
-        Decode the generated token prefix and return only the newly
-        available text.
-
-        Returns:
-            A tuple containing:
-
-            - newly generated text chunk
-            - complete decoded generated text so far
-        """
-
-        current_text = self.tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True,
-        )
-
-        if current_text.startswith(previous_text):
-            chunk = current_text[len(previous_text):]
-        else:
-            chunk = current_text
-
-        return chunk, current_text
+    # ------------------------------------------------------------------
+    # Prompt / token helpers
+    # ------------------------------------------------------------------
 
     def _truncate_prompt(
         self,
         token_ids: list[int],
     ) -> list[int]:
-        """
-        Keep only the most recent tokens that fit the context window.
-        """
+        """Keep only tokens that fit the context window."""
 
-        max_length = self.model.config.max_sequence_length
+        max_length = (
+            self.model.config.max_sequence_length
+        )
 
         if len(token_ids) <= max_length:
             return token_ids
 
         return token_ids[-max_length:]
 
-    def _get_forbidden_token_ids(self) -> tuple[int, ...]:
+    def _get_forbidden_token_ids(
+        self,
+    ) -> tuple[int, ...]:
         """Return special tokens that must never be generated."""
 
-        token_ids = []
+        token_ids: list[int] = []
 
         if self.pad_token_id is not None:
-            token_ids.append(self.pad_token_id)
+            token_ids.append(
+                self.pad_token_id
+            )
 
         if self.bos_token_id is not None:
-            token_ids.append(self.bos_token_id)
+            token_ids.append(
+                self.bos_token_id
+            )
 
         return tuple(token_ids)
 
@@ -714,7 +1029,10 @@ class TextGenerator:
     ) -> bool:
         """Return whether generation is allowed to terminate."""
 
-        return generated_token_count >= min_new_tokens
+        return (
+            generated_token_count
+            >= min_new_tokens
+        )
 
     # ------------------------------------------------------------------
     # Cache helpers
@@ -751,46 +1069,19 @@ class TextGenerator:
         return fallback
 
     # ------------------------------------------------------------------
-    # Sampling
+    # Backward-compatible sampling helpers
     # ------------------------------------------------------------------
 
-
-    @staticmethod
-    def _suppress_special_tokens(
-    self,
-    logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """Prevent non-generative special tokens from being sampled."""
-
-        logits = logits.clone()
-
-        logits[:, self.pad_token_id] = float("-inf")
-        logits[:, self.bos_token_id] = float("-inf")
-
-        return logits
-
-    @staticmethod
     @staticmethod
     def _apply_top_k(
         logits: Tensor,
         top_k: int,
     ) -> Tensor:
-        vocab_size = logits.size(-1)
+        """Backward-compatible wrapper for top-k filtering."""
 
-        top_k = min(
-            top_k,
-            vocab_size,
-        )
-
-        threshold = torch.topk(
+        return apply_top_k(
             logits,
             top_k,
-            dim=-1,
-        ).values[..., -1, None]
-
-        return logits.masked_fill(
-            logits < threshold,
-            float("-inf"),
         )
 
     @staticmethod
@@ -798,39 +1089,11 @@ class TextGenerator:
         logits: Tensor,
         top_p: float,
     ) -> Tensor:
-        sorted_logits, sorted_indices = torch.sort(
+        """Backward-compatible wrapper for top-p filtering."""
+
+        return apply_top_p(
             logits,
-            descending=True,
-            dim=-1,
-        )
-
-        sorted_probabilities = torch.softmax(
-            sorted_logits,
-            dim=-1,
-        )
-
-        cumulative_probabilities = torch.cumsum(
-            sorted_probabilities,
-            dim=-1,
-        )
-
-        remove_mask = cumulative_probabilities > top_p
-
-        remove_mask[..., 1:] = (
-            remove_mask[..., :-1].clone()
-        )
-
-        remove_mask[..., 0] = False
-
-        sorted_logits = sorted_logits.masked_fill(
-            remove_mask,
-            float("-inf"),
-        )
-
-        return torch.zeros_like(logits).scatter(
-            -1,
-            sorted_indices,
-            sorted_logits,
+            top_p,
         )
 
     # ------------------------------------------------------------------
@@ -865,10 +1128,13 @@ class TextGenerator:
                 "max_new_tokens must be non-negative."
             )
 
-        if config.max_new_tokens < config.min_new_tokens:
+        if (
+            config.max_new_tokens
+            < config.min_new_tokens
+        ):
             raise ValueError(
-                "max_new_tokens must be greater than or equal "
-                "to min_new_tokens."
+                "max_new_tokens must be greater than "
+                "or equal to min_new_tokens."
             )
 
         if config.temperature <= 0:
@@ -886,27 +1152,36 @@ class TextGenerator:
                 "top_p must be in the range (0, 1]."
             )
 
-        if not isinstance(config.do_sample, bool):
+        if not isinstance(
+            config.do_sample,
+            bool,
+        ):
             raise TypeError(
                 "do_sample must be a boolean."
             )
 
         if config.repetition_penalty < 1.0:
             raise ValueError(
-                "repetition_penalty must be greater than or equal to 1.0."
+                "repetition_penalty must be greater "
+                "than or equal to 1.0."
             )
 
         if config.frequency_penalty < 0.0:
             raise ValueError(
-                "frequency_penalty must be greater than or equal to 0.0."
+                "frequency_penalty must be greater "
+                "than or equal to 0.0."
             )
 
         if config.presence_penalty < 0.0:
             raise ValueError(
-                "presence_penalty must be greater than or equal to 0.0."
+                "presence_penalty must be greater "
+                "than or equal to 0.0."
             )
 
-        if not isinstance(config.stop_sequences, tuple):
+        if not isinstance(
+            config.stop_sequences,
+            tuple,
+        ):
             raise TypeError(
                 "stop_sequences must be a tuple of strings."
             )
@@ -924,5 +1199,6 @@ class TextGenerator:
             for sequence in config.stop_sequences
         ):
             raise ValueError(
-                "stop_sequences cannot contain empty strings."
+                "stop_sequences cannot contain "
+                "empty strings."
             )
