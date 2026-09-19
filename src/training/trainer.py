@@ -29,13 +29,19 @@ class TrainerConfig:
 
     max_epochs: int = 1
     max_steps: int | None = None
+
     gradient_accumulation_steps: int = 1
+
     max_grad_norm: float = 1.0
+
     log_every_steps: int = 10
     eval_every_steps: int = 100
     checkpoint_every_steps: int = 100
+
     max_eval_batches: int | None = None
+
     output_dir: str = "experiments/runs"
+
     seed: int = 42
 
     def __post_init__(self) -> None:
@@ -121,8 +127,9 @@ class Trainer:
         - FP32/FP16/BF16 support
         - automatic mixed precision
         - CUDA GradScaler for FP16
-        - gradient accumulation
-        - gradient clipping
+        - true micro-batch gradient accumulation
+        - correct partial accumulation handling
+        - gradient clipping after normalization
         - optimizer stepping
         - scheduler stepping
         - validation
@@ -131,8 +138,29 @@ class Trainer:
         - metric tracking
         - cumulative elapsed training time
 
-    The numerical runtime is resolved once during initialization.
-    The model is moved to the resolved device before training begins.
+    Gradient accumulation semantics:
+
+        N micro-batches
+            ↓
+        forward/backward
+            ↓
+        average accumulated gradients
+            ↓
+        gradient clipping
+            ↓
+        optimizer.step()
+            ↓
+        scheduler.step()
+
+    The accumulated gradient is always the arithmetic mean of the
+    micro-batch gradients. This remains correct when an epoch ends
+    with a partial accumulation window.
+
+    Resume semantics:
+
+        If a resumable sampler is provided, its internal position is
+        authoritative. The trainer does not independently skip those
+        already-consumed samples a second time.
     """
 
     def __init__(
@@ -219,6 +247,7 @@ class Trainer:
         self._timer_offset_seconds = 0.0
 
         self._micro_steps_since_update = 0
+
         self._accumulated_loss = 0.0
         self._accumulated_tokens = 0
 
@@ -311,7 +340,7 @@ class Trainer:
         """
         Restore the complete training state.
 
-        This restores:
+        Restores:
             - model
             - optimizer
             - scheduler
@@ -485,12 +514,28 @@ class Trainer:
             set_to_none=True
         )
 
-        self._micro_steps_since_update = 0
-        self._accumulated_loss = 0.0
-        self._accumulated_tokens = 0
+        self._reset_accumulation()
+
+        # The resumable sampler owns the consumed-sample position.
+        #
+        # Therefore, when a sampler is present, do NOT skip
+        # state.batch_in_epoch again. The DataLoader will already
+        # start from the restored sampler position.
+        #
+        # For non-resumable loaders, batch_in_epoch remains the
+        # fallback resume mechanism.
+        use_sampler_position = (
+            self.train_sampler is not None
+            and hasattr(
+                self.train_sampler,
+                "state_dict",
+            )
+        )
 
         batches_to_skip = (
-            self.state.batch_in_epoch
+            0
+            if use_sampler_position
+            else self.state.batch_in_epoch
         )
 
         for batch_index, batch in enumerate(
@@ -524,13 +569,13 @@ class Trainer:
                     targets,
                 )
 
-                scaled_loss = (
-                    loss
-                    / self.config.gradient_accumulation_steps
-                )
-
+            # Accumulate the raw micro-batch loss.
+            #
+            # Normalization is deliberately deferred until the
+            # optimizer step because the final accumulation window
+            # may contain fewer micro-batches than configured.
             self._backward(
-                scaled_loss
+                loss
             )
 
             self._accumulated_loss += float(
@@ -544,7 +589,9 @@ class Trainer:
             self._micro_steps_since_update += 1
 
             self.state.batch_in_epoch = (
-                batch_index + 1
+                self._next_batch_position(
+                    batch_index
+                )
             )
 
             if (
@@ -556,20 +603,61 @@ class Trainer:
                 if self._should_stop():
                     return
 
-        # If the epoch ended with a partial gradient
-        # accumulation, do not silently discard it.
+        # If the epoch ended with a partial accumulation,
+        # average those gradients over the actual number of
+        # micro-batches rather than the configured maximum.
         if not self._should_stop():
             self._flush_remaining_gradients()
 
+    def _next_batch_position(
+        self,
+        batch_index: int,
+    ) -> int:
+        """
+        Return the number of batches consumed in the current epoch.
+
+        For a resumable sampler, enumerate() starts from the remaining
+        portion of the DataLoader after restoration, so batch_index is
+        relative to the resumed iterator. We therefore derive the
+        absolute position from the sampler whenever possible.
+        """
+
+        if self.train_sampler is not None:
+            position = getattr(
+                self.train_sampler,
+                "position",
+                None,
+            )
+
+            if position is not None:
+                return self._samples_to_batches(
+                    int(position)
+                )
+
+        return batch_index + 1
+
     # ------------------------------------------------------------------
-    # Mixed precision
+    # Gradient accumulation
     # ------------------------------------------------------------------
+
+    def _reset_accumulation(self) -> None:
+        """Reset the current micro-batch accumulation window."""
+
+        self._micro_steps_since_update = 0
+        self._accumulated_loss = 0.0
+        self._accumulated_tokens = 0
 
     def _backward(
         self,
         loss: Tensor,
     ) -> None:
-        """Run backward with optional gradient scaling."""
+        """
+        Run backward for one micro-batch.
+
+        The loss is intentionally not divided here. Gradient
+        normalization is performed exactly once immediately before
+        clipping and the optimizer update.
+        """
 
         if self.scaler is not None:
             self.scaler.scale(
@@ -580,22 +668,57 @@ class Trainer:
 
         loss.backward()
 
+    def _normalize_accumulated_gradients(
+        self,
+        accumulation_count: int,
+    ) -> None:
+        """
+        Convert accumulated gradients into their arithmetic mean.
+
+        This is done after GradScaler unscaling so the operation is
+        numerically correct for FP16 training as well.
+        """
+
+        if accumulation_count <= 0:
+            raise ValueError(
+                "accumulation_count must be greater than 0."
+            )
+
+        for parameter in self.model.parameters():
+            gradient = parameter.grad
+
+            if gradient is None:
+                continue
+
+            gradient.div_(
+                accumulation_count
+            )
+
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
 
     def _optimizer_step(self) -> None:
-        """Perform one optimizer update."""
+        """Perform one optimizer update from accumulated gradients."""
 
-        if self._micro_steps_since_update <= 0:
+        accumulation_count = (
+            self._micro_steps_since_update
+        )
+
+        if accumulation_count <= 0:
             return
 
-        # GradScaler requires gradients to be unscaled before
-        # gradient clipping.
+        # GradScaler gradients must be unscaled before:
+        #   1. normalization
+        #   2. gradient clipping
         if self.scaler is not None:
             self.scaler.unscale_(
                 self.optimizer
             )
+
+        self._normalize_accumulated_gradients(
+            accumulation_count
+        )
 
         gradient_norm = clip_gradients(
             self.model,
@@ -620,6 +743,7 @@ class Trainer:
             optimizer_step_succeeded = (
                 new_scale >= old_scale
             )
+
         else:
             self.optimizer.step()
 
@@ -635,7 +759,7 @@ class Trainer:
 
         self.state.train_loss = (
             self._accumulated_loss
-            / self._micro_steps_since_update
+            / accumulation_count
         )
 
         self.state.total_tokens += (
@@ -650,9 +774,7 @@ class Trainer:
             self.optimizer.param_groups[0]["lr"]
         )
 
-        self._micro_steps_since_update = 0
-        self._accumulated_loss = 0.0
-        self._accumulated_tokens = 0
+        self._reset_accumulation()
 
         self.state.elapsed_seconds = (
             self._elapsed_training_seconds()
@@ -660,8 +782,8 @@ class Trainer:
 
         self._sync_metrics()
 
-        # Do not trigger evaluation/checkpointing for a step that
-        # was skipped because of numerical overflow.
+        # Do not trigger evaluation/checkpointing for an optimizer
+        # update that was skipped because of numerical overflow.
         if not optimizer_step_succeeded:
             return
 
@@ -791,9 +913,6 @@ class Trainer:
                 "dataloader_state must be a dictionary."
             )
 
-        # An empty dictionary means the checkpoint was created
-        # without resumable DataLoader state. This is valid for
-        # trainers that do not use a custom resumable sampler.
         if not dataloader_state:
             return
 
