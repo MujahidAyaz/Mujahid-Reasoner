@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -20,6 +21,74 @@ from src.model.cache import LayerKVCache
 from src.model.model import MujahidReasonerModel
 
 
+@dataclass(frozen=True)
+class GenerationResult:
+    """
+    Result of single-prompt generation.
+
+    `text` contains the original prompt followed by generated text.
+
+    `generated_token_ids` contains only newly generated token IDs,
+    excluding the prompt.
+
+    `generated_token_count` is the exact number of tokens produced
+    by the model.
+    """
+
+    text: str
+    generated_token_ids: tuple[int, ...]
+    generated_token_count: int
+
+    def __post_init__(self) -> None:
+        if self.generated_token_count < 0:
+            raise ValueError(
+                "generated_token_count must be non-negative."
+            )
+
+        if self.generated_token_count != len(
+            self.generated_token_ids
+        ):
+            raise ValueError(
+                "generated_token_count must match "
+                "generated_token_ids length."
+            )
+
+
+@dataclass(frozen=True)
+class BatchGenerationStats:
+    """
+    Exact statistics for batched generation.
+
+    `generated_token_counts[i]` corresponds to prompt `i`.
+    """
+
+    output: BatchGenerationOutput
+    generated_token_counts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.output.texts) != len(
+            self.generated_token_counts
+        ):
+            raise ValueError(
+                "Number of generated token counts must match "
+                "number of outputs."
+            )
+
+        if any(
+            count < 0
+            for count in self.generated_token_counts
+        ):
+            raise ValueError(
+                "generated token counts must be non-negative."
+            )
+
+    @property
+    def total_generated_tokens(self) -> int:
+        """Return the exact number of generated tokens across the batch."""
+
+        return sum(self.generated_token_counts)
+
+
 class TextGenerator:
     """
     Autoregressive text generator with optional KV caching.
@@ -27,7 +96,9 @@ class TextGenerator:
     Supports:
 
     - Standard full-text generation.
+    - Exact generation statistics.
     - Batched generation.
+    - Exact batched generation statistics.
     - Incremental streaming generation.
     - Preallocated KV-cache decoding.
     - Greedy decoding.
@@ -40,8 +111,10 @@ class TextGenerator:
     - Stop sequences.
     - Minimum generation length.
     - Maximum generation length.
+    - Special-token suppression.
 
-    The existing `generate()` API is preserved.
+    The existing `generate()` and `generate_batch()` APIs are
+    preserved.
     """
 
     def __init__(
@@ -79,6 +152,31 @@ class TextGenerator:
     ) -> str:
         """Generate complete text from a prompt."""
 
+        result = self.generate_with_stats(
+            prompt,
+            config=config,
+            use_cache=use_cache,
+        )
+
+        return result.text
+
+    @torch.inference_mode()
+    def generate_with_stats(
+        self,
+        prompt: str,
+        config: GenerationConfig | None = None,
+        use_cache: bool = True,
+    ) -> GenerationResult:
+        """
+        Generate text and return exact generation statistics.
+
+        The returned text contains the prompt followed by generated
+        text.
+
+        The returned token IDs and token count contain only newly
+        generated tokens and exclude the prompt.
+        """
+
         self._validate_prompt(prompt)
 
         if config is None:
@@ -86,14 +184,7 @@ class TextGenerator:
 
         self._validate_generation_config(config)
 
-        encoded = self.tokenizer.encode(prompt)
-        token_ids = encoded.ids
-
-        if not token_ids:
-            raise ValueError(
-                "Tokenizer produced no tokens."
-            )
-
+        token_ids = self._encode_prompt(prompt)
         token_ids = self._truncate_prompt(token_ids)
 
         input_ids = torch.tensor(
@@ -103,19 +194,33 @@ class TextGenerator:
         )
 
         if use_cache:
-            generated_ids = self._generate_with_cache(
+            full_generated_ids = self._generate_with_cache(
                 input_ids,
                 config,
             )
         else:
-            generated_ids = self._generate_without_cache(
+            full_generated_ids = self._generate_without_cache(
                 input_ids,
                 config,
             )
 
-        return self.tokenizer.decode(
-            generated_ids,
+        generated_ids = full_generated_ids[
+            len(token_ids):
+        ]
+
+        text = self.tokenizer.decode(
+            full_generated_ids,
             skip_special_tokens=True,
+        )
+
+        return GenerationResult(
+            text=text,
+            generated_token_ids=tuple(
+                generated_ids
+            ),
+            generated_token_count=len(
+                generated_ids
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -135,44 +240,38 @@ class TextGenerator:
         share the current KV-cache implementation.
         """
 
-        if not prompts:
-            raise ValueError(
-                "prompts must not be empty."
-            )
+        result = self.generate_batch_with_stats(
+            prompts,
+            config=config,
+        )
 
-        if not all(
-            isinstance(prompt, str)
-            for prompt in prompts
-        ):
-            raise ValueError(
-                "all prompts must be strings."
-            )
+        return result.output
 
-        if not all(
-            prompt.strip()
-            for prompt in prompts
-        ):
-            raise ValueError(
-                "all prompts must be non-empty."
-            )
+    @torch.inference_mode()
+    def generate_batch_with_stats(
+        self,
+        prompts: tuple[str, ...],
+        config: GenerationConfig | None = None,
+    ) -> BatchGenerationStats:
+        """
+        Generate multiple prompts and return exact token statistics.
 
-        config = config or GenerationConfig()
+        Prompts with equal tokenized lengths are processed together.
+        Results are restored to the original prompt ordering.
+        """
+
+        self._validate_prompts(prompts)
+
+        if config is None:
+            config = GenerationConfig()
 
         self._validate_generation_config(config)
 
         encoded_prompts = [
-            self.tokenizer.encode(prompt).ids
-            for prompt in prompts
-        ]
-
-        if not all(encoded_prompts):
-            raise ValueError(
-                "all prompts must tokenize to at least one token."
+            self._truncate_prompt(
+                self._encode_prompt(prompt)
             )
-
-        encoded_prompts = [
-            self._truncate_prompt(token_ids)
-            for token_ids in encoded_prompts
+            for prompt in prompts
         ]
 
         groups = group_prompt_indices_by_length(
@@ -180,6 +279,10 @@ class TextGenerator:
         )
 
         results: list[str | None] = [
+            None
+        ] * len(prompts)
+
+        token_counts: list[int | None] = [
             None
         ] * len(prompts)
 
@@ -198,12 +301,17 @@ class TextGenerator:
                 config,
             )
 
+            prompt_length = batch_input_ids.size(1)
+
             for row, original_index in enumerate(indices):
-                results[original_index] = (
-                    self.tokenizer.decode(
-                        generated_ids[row],
-                        skip_special_tokens=True,
-                    )
+                results[original_index] = self.tokenizer.decode(
+                    generated_ids[row],
+                    skip_special_tokens=True,
+                )
+
+                token_counts[original_index] = (
+                    len(generated_ids[row])
+                    - prompt_length
                 )
 
         if any(
@@ -215,8 +323,30 @@ class TextGenerator:
                 "all outputs."
             )
 
-        return BatchGenerationOutput(
-            texts=tuple(results),
+        if any(
+            count is None
+            for count in token_counts
+        ):
+            raise RuntimeError(
+                "Batched generation failed to produce "
+                "all token counts."
+            )
+
+        output = BatchGenerationOutput(
+            texts=tuple(
+                result
+                for result in results
+                if result is not None
+            ),
+        )
+
+        return BatchGenerationStats(
+            output=output,
+            generated_token_counts=tuple(
+                count
+                for count in token_counts
+                if count is not None
+            ),
         )
 
     def _generate_batch_with_cache(
@@ -312,9 +442,7 @@ class TextGenerator:
                     active_logits,
                     config,
                     generated_ids=active_histories,
-                    forbidden_token_ids=(
-                        forbidden_token_ids
-                    ),
+                    forbidden_token_ids=forbidden_token_ids,
                 )
 
                 for row, batch_index in enumerate(
@@ -345,13 +473,11 @@ class TextGenerator:
 
                 generated_token_counts[index] += 1
 
-                generated_text = (
-                    self.tokenizer.decode(
-                        generated_ids[index][
-                            prompt_length:
-                        ],
-                        skip_special_tokens=True,
-                    )
+                generated_text = self.tokenizer.decode(
+                    generated_ids[index][
+                        prompt_length:
+                    ],
+                    skip_special_tokens=True,
                 )
 
                 can_stop = self._can_stop(
@@ -426,14 +552,7 @@ class TextGenerator:
 
         self._validate_generation_config(config)
 
-        encoded = self.tokenizer.encode(prompt)
-        token_ids = encoded.ids
-
-        if not token_ids:
-            raise ValueError(
-                "Tokenizer produced no tokens."
-            )
-
+        token_ids = self._encode_prompt(prompt)
         token_ids = self._truncate_prompt(token_ids)
 
         input_ids = torch.tensor(
@@ -479,6 +598,10 @@ class TextGenerator:
 
         next_logits = logits[:, -1, :]
 
+        forbidden_token_ids = (
+            self._get_forbidden_token_ids()
+        )
+
         for _ in range(
             config.max_new_tokens
         ):
@@ -489,9 +612,7 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
-                forbidden_token_ids=(
-                    self._get_forbidden_token_ids()
-                ),
+                forbidden_token_ids=forbidden_token_ids,
             )
 
             token_id = int(
@@ -507,13 +628,11 @@ class TextGenerator:
                 - prompt_length
             )
 
-            current_text = (
-                self.tokenizer.decode(
-                    generated_ids[
-                        prompt_length:
-                    ],
-                    skip_special_tokens=True,
-                )
+            current_text = self.tokenizer.decode(
+                generated_ids[
+                    prompt_length:
+                ],
+                skip_special_tokens=True,
             )
 
             can_stop = self._can_stop(
@@ -536,11 +655,9 @@ class TextGenerator:
             ):
                 break
 
-            position_offset = (
-                self._get_cache_length(
-                    cache,
-                    fallback=len(generated_ids) - 1,
-                )
+            position_offset = self._get_cache_length(
+                cache,
+                fallback=len(generated_ids) - 1,
             )
 
             next_input = next_token.view(
@@ -593,6 +710,10 @@ class TextGenerator:
 
         emitted_text = ""
 
+        forbidden_token_ids = (
+            self._get_forbidden_token_ids()
+        )
+
         for _ in range(
             config.max_new_tokens
         ):
@@ -603,9 +724,7 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
-                forbidden_token_ids=(
-                    self._get_forbidden_token_ids()
-                ),
+                forbidden_token_ids=forbidden_token_ids,
             )
 
             token_id = int(
@@ -621,13 +740,11 @@ class TextGenerator:
                 - prompt_length
             )
 
-            current_text = (
-                self.tokenizer.decode(
-                    generated_ids[
-                        prompt_length:
-                    ],
-                    skip_special_tokens=True,
-                )
+            current_text = self.tokenizer.decode(
+                generated_ids[
+                    prompt_length:
+                ],
+                skip_special_tokens=True,
             )
 
             can_stop = self._can_stop(
@@ -665,15 +782,13 @@ class TextGenerator:
             ):
                 break
 
-            position_offset = (
-                self._get_cache_length(
-                    cache,
-                    fallback=(
-                        len(input_ids[0])
-                        + generated_token_count
-                        - 1
-                    ),
-                )
+            position_offset = self._get_cache_length(
+                cache,
+                fallback=(
+                    len(input_ids[0])
+                    + generated_token_count
+                    - 1
+                ),
             )
 
             next_input = next_token.view(
@@ -715,6 +830,10 @@ class TextGenerator:
         generated_ids = input_ids[0].tolist()
         prompt_length = len(generated_ids)
 
+        forbidden_token_ids = (
+            self._get_forbidden_token_ids()
+        )
+
         for _ in range(
             config.max_new_tokens
         ):
@@ -748,9 +867,7 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
-                forbidden_token_ids=(
-                    self._get_forbidden_token_ids()
-                ),
+                forbidden_token_ids=forbidden_token_ids,
             )
 
             token_id = int(
@@ -766,13 +883,11 @@ class TextGenerator:
                 - prompt_length
             )
 
-            current_text = (
-                self.tokenizer.decode(
-                    generated_ids[
-                        prompt_length:
-                    ],
-                    skip_special_tokens=True,
-                )
+            current_text = self.tokenizer.decode(
+                generated_ids[
+                    prompt_length:
+                ],
+                skip_special_tokens=True,
             )
 
             can_stop = self._can_stop(
@@ -813,6 +928,10 @@ class TextGenerator:
 
         emitted_text = ""
 
+        forbidden_token_ids = (
+            self._get_forbidden_token_ids()
+        )
+
         for _ in range(
             config.max_new_tokens
         ):
@@ -846,9 +965,7 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
-                forbidden_token_ids=(
-                    self._get_forbidden_token_ids()
-                ),
+                forbidden_token_ids=forbidden_token_ids,
             )
 
             token_id = int(
@@ -864,13 +981,11 @@ class TextGenerator:
                 - prompt_length
             )
 
-            generated_text = (
-                self.tokenizer.decode(
-                    generated_ids[
-                        prompt_length:
-                    ],
-                    skip_special_tokens=True,
-                )
+            generated_text = self.tokenizer.decode(
+                generated_ids[
+                    prompt_length:
+                ],
+                skip_special_tokens=True,
             )
 
             can_stop = self._can_stop(
@@ -907,6 +1022,79 @@ class TextGenerator:
                 and can_stop
             ):
                 break
+
+    # ------------------------------------------------------------------
+    # Prompt / token helpers
+    # ------------------------------------------------------------------
+
+    def _encode_prompt(
+        self,
+        prompt: str,
+    ) -> list[int]:
+        """Encode a prompt into tokenizer IDs."""
+
+        encoded = self.tokenizer.encode(prompt)
+        token_ids = encoded.ids
+
+        if not token_ids:
+            raise ValueError(
+                "Tokenizer produced no tokens."
+            )
+
+        return token_ids
+
+    def _truncate_prompt(
+        self,
+        token_ids: list[int],
+    ) -> list[int]:
+        """
+        Keep tokens inside the model context window.
+
+        If the prompt exceeds the model context window, retain the
+        most recent tokens.
+        """
+
+        max_length = (
+            self.model.config.max_sequence_length
+        )
+
+        if len(token_ids) <= max_length:
+            return token_ids
+
+        return token_ids[
+            -max_length:
+        ]
+
+    def _get_forbidden_token_ids(
+        self,
+    ) -> tuple[int, ...]:
+        """Return special tokens that must never be generated."""
+
+        token_ids: list[int] = []
+
+        if self.pad_token_id is not None:
+            token_ids.append(
+                self.pad_token_id
+            )
+
+        if self.bos_token_id is not None:
+            token_ids.append(
+                self.bos_token_id
+            )
+
+        return tuple(token_ids)
+
+    @staticmethod
+    def _can_stop(
+        generated_token_count: int,
+        min_new_tokens: int,
+    ) -> bool:
+        """Return whether generation is allowed to terminate."""
+
+        return (
+            generated_token_count
+            >= min_new_tokens
+        )
 
     # ------------------------------------------------------------------
     # Stream text helpers
@@ -982,56 +1170,6 @@ class TextGenerator:
         return any(
             sequence in text
             for sequence in stop_sequences
-        )
-
-    # ------------------------------------------------------------------
-    # Prompt / token helpers
-    # ------------------------------------------------------------------
-
-    def _truncate_prompt(
-        self,
-        token_ids: list[int],
-    ) -> list[int]:
-        """Keep only tokens that fit the context window."""
-
-        max_length = (
-            self.model.config.max_sequence_length
-        )
-
-        if len(token_ids) <= max_length:
-            return token_ids
-
-        return token_ids[-max_length:]
-
-    def _get_forbidden_token_ids(
-        self,
-    ) -> tuple[int, ...]:
-        """Return special tokens that must never be generated."""
-
-        token_ids: list[int] = []
-
-        if self.pad_token_id is not None:
-            token_ids.append(
-                self.pad_token_id
-            )
-
-        if self.bos_token_id is not None:
-            token_ids.append(
-                self.bos_token_id
-            )
-
-        return tuple(token_ids)
-
-    @staticmethod
-    def _can_stop(
-        generated_token_count: int,
-        min_new_tokens: int,
-    ) -> bool:
-        """Return whether generation is allowed to terminate."""
-
-        return (
-            generated_token_count
-            >= min_new_tokens
         )
 
     # ------------------------------------------------------------------
@@ -1112,6 +1250,32 @@ class TextGenerator:
         if not prompt.strip():
             raise ValueError(
                 "prompt must not be empty."
+            )
+
+    @classmethod
+    def _validate_prompts(
+        cls,
+        prompts: Sequence[str],
+    ) -> None:
+        if not prompts:
+            raise ValueError(
+                "prompts must not be empty."
+            )
+
+        if not all(
+            isinstance(prompt, str)
+            for prompt in prompts
+        ):
+            raise ValueError(
+                "all prompts must be strings."
+            )
+
+        if not all(
+            prompt.strip()
+            for prompt in prompts
+        ):
+            raise ValueError(
+                "all prompts must be non-empty."
             )
 
     @staticmethod
