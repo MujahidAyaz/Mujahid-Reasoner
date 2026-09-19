@@ -507,3 +507,113 @@ def test_greedy_generation_without_cache(generator):
     )
 
     assert output == "hello world hello hello hello"
+
+def test_special_token_suppression_blocks_pad_and_bos():
+    logits = torch.tensor(
+        [[10.0, 9.0, 1.0, 2.0, 3.0]],
+        dtype=torch.float32,
+    )
+
+    config = GenerationConfig(do_sample=False)
+
+    next_token = TextGenerator._sample_token(
+        logits,
+        config,
+        forbidden_token_ids=(0, 1),
+    )
+
+    assert next_token.item() == 4
+
+
+def test_special_token_suppression_allows_eos():
+    logits = torch.tensor(
+        [[1.0, 2.0, 10.0, 3.0]],
+        dtype=torch.float32,
+    )
+
+    config = GenerationConfig(do_sample=False)
+
+    next_token = TextGenerator._sample_token(
+        logits,
+        config,
+        forbidden_token_ids=(0, 1),
+    )
+
+    assert next_token.item() == 2
+
+
+def test_special_token_suppression_allows_unk():
+    logits = torch.tensor(
+        [[1.0, 2.0, 3.0, 10.0]],
+        dtype=torch.float32,
+    )
+
+    config = GenerationConfig(do_sample=False)
+
+    next_token = TextGenerator._sample_token(
+        logits,
+        config,
+        forbidden_token_ids=(0, 1),
+    )
+
+    assert next_token.item() == 3
+
+
+def test_special_token_suppression_does_not_mutate_logits():
+    logits = torch.tensor(
+        [[10.0, 9.0, 1.0, 2.0]],
+        dtype=torch.float32,
+    )
+
+    original = logits.clone()
+
+    config = GenerationConfig(do_sample=False)
+
+    TextGenerator._sample_token(
+        logits,
+        config,
+        forbidden_token_ids=(0, 1),
+    )
+
+    assert torch.equal(logits, original)
+
+
+def test_special_token_suppression_handles_invalid_ids():
+    logits = torch.tensor(
+        [[1.0, 2.0, 10.0]],
+        dtype=torch.float32,
+    )
+
+    config = GenerationConfig(do_sample=False)
+
+    next_token = TextGenerator._sample_token(
+        logits,
+        config,
+        forbidden_token_ids=(-1, 99),
+    )
+
+    assert next_token.item() == 2
+
+
+def test_special_token_suppression_works_with_sampling():
+    logits = torch.tensor(
+        [[10.0, 9.0, 1.0, 2.0]],
+        dtype=torch.float32,
+    )
+
+    config = GenerationConfig(
+        do_sample=True,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
+    )
+
+    torch.manual_seed(42)
+
+    next_token = TextGenerator._sample_token(
+        logits,
+        config,
+        forbidden_token_ids=(0, 1),
+    )
+
+    assert next_token.item() in {2, 3}

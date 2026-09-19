@@ -61,17 +61,14 @@ class TextGenerator:
 
         self.model.eval()
 
+        self.pad_token_id = tokenizer.token_to_id("<pad>")
         self.bos_token_id = tokenizer.token_to_id("<bos>")
         self.eos_token_id = tokenizer.token_to_id("<eos>")
-
-        if self.bos_token_id is None:
-            raise ValueError(
-                "Tokenizer does not contain a <bos> token."
-            )
+        self.unk_token_id = tokenizer.token_to_id("<unk>")
 
         if self.eos_token_id is None:
             raise ValueError(
-                "Tokenizer does not contain a <eos> token."
+                "Tokenizer does not contain an <eos> token."
             )
 
     # ------------------------------------------------------------------
@@ -221,6 +218,7 @@ class TextGenerator:
                 next_logits,
                 config,
                 generated_ids=generated_ids,
+                forbidden_token_ids=self._get_forbidden_token_ids(),
             )
 
             token_id = int(next_token.item())
@@ -706,6 +704,19 @@ class TextGenerator:
 
         return token_ids[-max_length:]
 
+    def _get_forbidden_token_ids(self) -> tuple[int, ...]:
+        """Return special tokens that must never be generated."""
+
+        token_ids = []
+
+        if self.pad_token_id is not None:
+            token_ids.append(self.pad_token_id)
+
+        if self.bos_token_id is not None:
+            token_ids.append(self.bos_token_id)
+
+        return tuple(token_ids)
+
     @staticmethod
     def _can_stop(
         generated_token_count: int,
@@ -753,29 +764,29 @@ class TextGenerator:
     # Sampling
     # ------------------------------------------------------------------
 
+
     @staticmethod
     def _sample_token(
         logits: Tensor,
         config: GenerationConfig,
         generated_ids: list[int] | None = None,
+        forbidden_token_ids: tuple[int, ...] = (),
     ) -> Tensor:
         """
         Select the next token using either greedy decoding or sampling.
-
-        Greedy decoding:
-            Selects the token with the highest probability.
-
-        Sampling:
-            Applies temperature, repetition penalty,
-            frequency/presence penalties, top-k, and top-p,
-            then samples from the resulting probability
-            distribution.
         """
 
         if logits.ndim != 2:
             raise ValueError(
                 "Logits must have shape [batch, vocab_size]."
             )
+
+        if forbidden_token_ids:
+            logits = logits.clone()
+
+            for token_id in forbidden_token_ids:
+                if 0 <= token_id < logits.size(-1):
+                    logits[:, token_id] = float("-inf")
 
         if not config.do_sample:
             return torch.argmax(
@@ -871,6 +882,19 @@ class TextGenerator:
         penalized_logits[:, token_ids] = selected_logits
 
         return penalized_logits
+
+    def _suppress_special_tokens(
+    self,
+    logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prevent non-generative special tokens from being sampled."""
+
+        logits = logits.clone()
+
+        logits[:, self.pad_token_id] = float("-inf")
+        logits[:, self.bos_token_id] = float("-inf")
+
+        return logits
 
     @staticmethod
     def _apply_frequency_presence_penalties(
