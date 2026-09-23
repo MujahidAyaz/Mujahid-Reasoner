@@ -21,13 +21,8 @@ from src.model.model import MujahidReasonerModel
 from src.training.config import load_training_config
 from src.training.loss import CausalLanguageModelLoss
 from src.training.optimizer import create_adamw_optimizer
-from src.training.scheduler import (
-    create_warmup_cosine_scheduler,
-)
-from src.training.trainer import (
-    Trainer,
-    TrainerConfig,
-)
+from src.training.scheduler import create_warmup_cosine_scheduler
+from src.training.trainer import Trainer, TrainerConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,18 +33,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=PROJECT_ROOT
-        / "configs"
-        / "training.yaml",
+        default=PROJECT_ROOT / "configs" / "training.yaml",
         help="Path to training configuration.",
     )
 
     parser.add_argument(
         "--model-config",
         type=Path,
-        default=PROJECT_ROOT
-        / "configs"
-        / "model.yaml",
+        default=PROJECT_ROOT / "configs" / "model.yaml",
         help="Path to model configuration.",
     )
 
@@ -79,13 +70,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    config = load_training_config(
-        args.config
-    )
-
-    model_config = load_model_config(
-        args.model_config
-    )
+    config = load_training_config(args.config)
+    model_config = load_model_config(args.model_config)
 
     max_steps = (
         args.max_steps
@@ -99,39 +85,28 @@ def main() -> None:
         else config.training.device
     )
 
-    resume = (
-        args.resume
-        or config.checkpoint.resume
-    )
+    resume = args.resume or config.checkpoint.resume
 
-    set_seed(
-        config.training.seed
-    )
+    set_seed(config.training.seed)
 
     print("=" * 60)
     print("Mujahid-Reasoner Training")
     print("=" * 60)
 
+    print(f"Device          : {device}")
+    print(f"Precision       : {config.training.precision}")
+    print(f"Compile         : {config.training.compile}")
     print(
-        f"Device          : "
-        f"{device}"
+        f"Gradient Checkpointing : "
+        f"{config.training.gradient_checkpointing}"
     )
-
+    print(f"Sequence length : {config.sequence.length}")
+    print(f"Batch size      : {config.dataloader.batch_size}")
     print(
-        f"Sequence length : "
-        f"{config.sequence.length}"
+        f"Gradient accumulation : "
+        f"{config.training.gradient_accumulation_steps}"
     )
-
-    print(
-        f"Batch size      : "
-        f"{config.dataloader.batch_size}"
-    )
-
-    print(
-        f"Max steps       : "
-        f"{max_steps}"
-    )
-
+    print(f"Max steps       : {max_steps}")
     print()
 
     data_loader_config = DataLoaderConfig(
@@ -143,33 +118,21 @@ def main() -> None:
     )
 
     data_module = LanguageModelDataModule(
-        train_file=PROJECT_ROOT
-        / config.data.train_file,
-        validation_file=PROJECT_ROOT
-        / config.data.validation_file,
+        train_file=PROJECT_ROOT / config.data.train_file,
+        validation_file=PROJECT_ROOT / config.data.validation_file,
         sequence_length=config.sequence.length,
         config=data_loader_config,
         seed=config.training.seed,
     )
 
     train_loader = data_module.train_dataloader()
+    validation_loader = data_module.validation_dataloader()
 
-    validation_loader = (
-        data_module.validation_dataloader()
-    )
+    model = MujahidReasonerModel(model_config)
 
-    model = MujahidReasonerModel(
-        model_config
-    )
+    parameter_count = model.parameter_count()
 
-    parameter_count = (
-        model.parameter_count()
-    )
-
-    print(
-        f"Parameters      : "
-        f"{parameter_count:,}"
-    )
+    print(f"Parameters      : {parameter_count:,}")
 
     optimizer = create_adamw_optimizer(
         model,
@@ -182,9 +145,7 @@ def main() -> None:
         eps=config.training.optimizer_eps,
     )
 
-    total_steps = (
-        config.training.max_steps
-    )
+    total_steps = config.training.max_steps
 
     if total_steps is None:
         steps_per_epoch = (
@@ -192,10 +153,7 @@ def main() -> None:
             // config.training.gradient_accumulation_steps
         )
 
-        total_steps = (
-            steps_per_epoch
-            * config.training.max_epochs
-        )
+        total_steps = steps_per_epoch * config.training.max_epochs
 
     scheduler = create_warmup_cosine_scheduler(
         optimizer,
@@ -206,6 +164,11 @@ def main() -> None:
 
     trainer_config = TrainerConfig(
         device=device,
+        precision=config.training.precision,
+        allow_tf32=config.training.allow_tf32,
+        cudnn_benchmark=config.training.cudnn_benchmark,
+        compile=config.training.compile,
+        gradient_checkpointing=config.training.gradient_checkpointing,
         max_epochs=config.training.max_epochs,
         max_steps=max_steps,
         gradient_accumulation_steps=(
@@ -217,12 +180,9 @@ def main() -> None:
         checkpoint_every_steps=(
             config.training.checkpoint_every_steps
         ),
-        max_eval_batches=(
-            config.training.max_eval_batches
-        ),
+        max_eval_batches=config.training.max_eval_batches,
         output_dir=(
-            PROJECT_ROOT
-            / config.output.directory
+            PROJECT_ROOT / config.output.directory
         ).as_posix(),
         seed=config.training.seed,
     )
@@ -259,15 +219,8 @@ def main() -> None:
     print("Training Complete")
     print("=" * 60)
 
-    print(
-        f"Global step     : "
-        f"{state.global_step}"
-    )
-
-    print(
-        f"Train loss      : "
-        f"{state.train_loss:.4f}"
-    )
+    print(f"Global step     : {state.global_step}")
+    print(f"Train loss      : {state.train_loss:.4f}")
 
     if state.validation_loss != float("inf"):
         print(

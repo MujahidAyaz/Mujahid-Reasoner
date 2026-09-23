@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch import Tensor, nn
@@ -27,6 +27,7 @@ class TrainerConfig:
     allow_tf32: bool = True
     cudnn_benchmark: bool = True
 
+    compile: bool = False
     gradient_checkpointing: bool = False
 
     max_epochs: int = 1
@@ -47,6 +48,19 @@ class TrainerConfig:
     seed: int = 42
 
     def __post_init__(self) -> None:
+        if not isinstance(self.compile, bool):
+            raise ValueError(
+                "compile must be a boolean."
+            )
+
+        if not isinstance(
+            self.gradient_checkpointing,
+            bool,
+        ):
+            raise ValueError(
+                "gradient_checkpointing must be a boolean."
+            )
+
         if self.max_epochs <= 0:
             raise ValueError(
                 "max_epochs must be greater than 0."
@@ -129,6 +143,7 @@ class Trainer:
         - FP32/FP16/BF16 support
         - automatic mixed precision
         - CUDA GradScaler for FP16
+        - optional torch.compile forward optimization
         - optional gradient checkpointing
         - true micro-batch gradient accumulation
         - correct partial accumulation handling
@@ -140,6 +155,31 @@ class Trainer:
         - deterministic sampler-aware resume
         - metric tracking
         - cumulative elapsed training time
+
+    Compilation architecture:
+
+        The canonical model remains stored in ``self.model``.
+
+        Optimizer state, checkpoints, model state_dict(), and resume
+        operations always operate on this canonical model.
+
+        When compilation is enabled, ``self._forward_model`` becomes
+        a compiled wrapper around the canonical model:
+
+            self.model
+                ↓
+            torch.compile(...)
+                ↓
+            self._forward_model
+
+        This deliberately avoids replacing ``self.model`` with the
+        compiled wrapper. PyTorch compiled wrappers can alter the
+        visible state_dict key namespace, which would make checkpoint
+        portability unnecessarily fragile.
+
+        When compilation is disabled:
+
+            self._forward_model is self.model
 
     Gradient accumulation semantics:
 
@@ -206,6 +246,9 @@ class Trainer:
 
         self.device = self.runtime.device
 
+        # The canonical model always remains the original nn.Module.
+        # Checkpoints, optimizer parameters, and state_dict operations
+        # use this object regardless of whether compilation is enabled.
         self.model = model.to(
             self.device
         )
@@ -215,6 +258,16 @@ class Trainer:
         # --------------------------------------------------------------
 
         self._configure_gradient_checkpointing()
+
+        # --------------------------------------------------------------
+        # Forward execution
+        # --------------------------------------------------------------
+
+        self._forward_model: nn.Module = (
+            self.model
+        )
+
+        self._configure_compilation()
 
         self.scaler = (
             self.runtime.create_grad_scaler()
@@ -286,6 +339,11 @@ class Trainer:
         print(
             f"Training runtime: {self.runtime.summary()}"
         )
+
+        if self.config.compile:
+            print(
+                "Training forward: torch.compile enabled"
+            )
 
         for epoch in range(
             self.state.epoch,
@@ -453,8 +511,10 @@ class Trainer:
                     )
 
                     with self.runtime.autocast_context():
-                        model_output = self.model(
-                            inputs
+                        model_output = (
+                            self._forward_model(
+                                inputs
+                            )
                         )
 
                         logits = (
@@ -547,6 +607,54 @@ class Trainer:
         if callable(disable):
             disable()
 
+    def _configure_compilation(self) -> None:
+        """
+        Configure the optional compiled forward path.
+
+        The canonical model remains untouched as the checkpoint and
+        optimizer model. Compilation only wraps its forward execution.
+
+        This method intentionally uses the default torch.compile
+        backend/mode. Backend-specific tuning belongs to a later
+        performance/benchmarking phase after correctness is established.
+        """
+
+        if not self.config.compile:
+            return
+
+        compile_fn = getattr(
+            torch,
+            "compile",
+            None,
+        )
+
+        if not callable(compile_fn):
+            raise RuntimeError(
+                "compile=True was requested, but this PyTorch build "
+                "does not provide torch.compile()."
+            )
+
+        try:
+            compiled_model = compile_fn(
+                self.model
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize torch.compile for the training "
+                "forward path."
+            ) from exc
+
+        if not isinstance(
+            compiled_model,
+            nn.Module,
+        ):
+            raise TypeError(
+                "torch.compile() returned an object that is not "
+                "an nn.Module."
+            )
+
+        self._forward_model = compiled_model
+
     # ------------------------------------------------------------------
     # Epoch handling
     # ------------------------------------------------------------------
@@ -617,8 +725,10 @@ class Trainer:
             )
 
             with self.runtime.autocast_context():
-                model_output = self.model(
-                    inputs
+                model_output = (
+                    self._forward_model(
+                        inputs
+                    )
                 )
 
                 logits = (
@@ -928,6 +1038,11 @@ class Trainer:
             self._build_dataloader_state()
         )
 
+        # IMPORTANT:
+        # Always save the canonical uncompiled model.
+        #
+        # This keeps checkpoint state_dict keys stable regardless
+        # of whether torch.compile is enabled for forward execution.
         self.checkpoint_manager.save(
             model=self.model,
             optimizer=self.optimizer,
