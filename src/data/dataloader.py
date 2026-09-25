@@ -250,6 +250,8 @@ class DataLoaderConfig:
         num_workers: int = 0,
         pin_memory: bool = False,
         drop_last: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
     ) -> None:
         if batch_size < 1:
             raise ValueError(
@@ -261,11 +263,48 @@ class DataLoaderConfig:
                 "num_workers cannot be negative."
             )
 
+        if prefetch_factor < 1:
+            raise ValueError(
+                "prefetch_factor must be at least 1."
+            )
+
+        if persistent_workers and num_workers == 0:
+            raise ValueError(
+                "persistent_workers requires num_workers > 0."
+            )
+
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.drop_last = drop_last
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
+
+    def dataloader_kwargs(self) -> dict[str, object]:
+        """
+        Return validated DataLoader keyword arguments.
+
+        DataLoader only accepts prefetch_factor when worker processes
+        are enabled, so the argument is omitted for num_workers=0.
+        """
+
+        kwargs: dict[str, object] = {
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "drop_last": self.drop_last,
+        }
+
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = (
+                self.persistent_workers
+            )
+            kwargs["prefetch_factor"] = (
+                self.prefetch_factor
+            )
+
+        return kwargs
 
 
 class LanguageModelDataModule:
@@ -274,6 +313,11 @@ class LanguageModelDataModule:
 
     Training uses a deterministic resumable sampler whenever shuffling
     is enabled. Validation remains sequential and deterministic.
+
+    Exact mid-epoch training resume currently requires
+    num_workers=0 because multiprocessing DataLoader workers may
+    prefetch sampler indices ahead of the batch actually processed by
+    the training loop.
     """
 
     def __init__(
@@ -288,6 +332,11 @@ class LanguageModelDataModule:
         if seed < 0:
             raise ValueError(
                 "seed must be non-negative."
+            )
+
+        if sequence_length < 1:
+            raise ValueError(
+                "sequence_length must be at least 1."
             )
 
         self.train_file = train_file
@@ -336,8 +385,17 @@ class LanguageModelDataModule:
 
         return self._train_sampler
 
+    def _loader_kwargs(
+        self,
+    ) -> dict[str, object]:
+        """Return common DataLoader configuration."""
+
+        return self.config.dataloader_kwargs()
+
     def train_dataloader(self) -> DataLoader:
         """Create the training DataLoader."""
+
+        loader_kwargs = self._loader_kwargs()
 
         if self.config.shuffle:
             if self.config.num_workers != 0:
@@ -353,22 +411,16 @@ class LanguageModelDataModule:
 
             return DataLoader(
                 self.train_dataset,
-                batch_size=self.config.batch_size,
                 sampler=self._train_sampler,
-                num_workers=self.config.num_workers,
-                pin_memory=self.config.pin_memory,
-                drop_last=self.config.drop_last,
+                **loader_kwargs,
             )
 
         self._train_sampler = None
 
         return DataLoader(
             self.train_dataset,
-            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            drop_last=self.config.drop_last,
+            **loader_kwargs,
         )
 
     def validation_dataloader(self) -> DataLoader:
@@ -376,11 +428,8 @@ class LanguageModelDataModule:
 
         return DataLoader(
             self.validation_dataset,
-            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            drop_last=False,
+            **self._loader_kwargs(),
         )
 
     def state_dict(self) -> dict[str, object]:
