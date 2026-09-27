@@ -30,3 +30,4 @@ Thumbs.db
 # 100M-token dataset
 data/processed_100m/
 
+data/processed_1b/

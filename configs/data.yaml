@@ -1,4 +1,3 @@
-
 dataset:
   name: "HuggingFaceFW/fineweb-edu"
   config: "sample-10BT"
@@ -8,10 +7,10 @@ dataset:
 output:
   raw_dir: "data/raw"
   interim_dir: "data/interim"
-  processed_dir: "data/processed_100m"
+  processed_dir: "data/processed_1b"
 
 processing:
-  max_documents: 100000
+  max_documents: 1000000
   min_characters: 200
   max_characters: 100000
   validation_ratio: 0.01
