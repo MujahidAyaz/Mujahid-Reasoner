@@ -1,6 +1,6 @@
 data:
-  train_file: "data/processed/tokens/train.bin"
-  validation_file: "data/processed/tokens/validation.bin"
+  train_file: "data/processed_100m/tokens/train.bin"
+  validation_file: "data/processed_100m/tokens/validation.bin"
 
 tokenizer:
   path: "tokenizer/tokenizer.json"
@@ -20,38 +20,30 @@ dataloader:
 training:
   device: "auto"
   precision: "auto"
-
   compile: false
   gradient_checkpointing: false
-
   allow_tf32: true
   cudnn_benchmark: true
-
   max_epochs: 1
-  max_steps: 1000
-
+  max_steps: 98907
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
-
   learning_rate: 0.0003
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   optimizer_eps: 0.00000001
-
   warmup_steps: 100
   min_lr_ratio: 0.1
-
   log_every_steps: 10
   eval_every_steps: 100
   checkpoint_every_steps: 100
   max_eval_batches: 20
-
   seed: 42
 
 output:
-  directory: "experiments/runs/mujahid-reasoner"
+  directory: "experiments/runs/mujahid-reasoner-100m"
 
 checkpoint:
-  resume: false
+  resume: true
   filename: "latest.pt"

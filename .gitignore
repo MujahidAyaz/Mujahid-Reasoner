@@ -27,3 +27,6 @@ mlruns/
 # OS
 .DS_Store
 Thumbs.db
+# 100M-token dataset
+data/processed_100m/
+
