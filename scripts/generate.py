@@ -23,7 +23,7 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "experiments"
     / "runs"
-    / "mujahid-reasoner"
+    / "mujahid-reasoner-1b"
     / "checkpoints"
     / "best.pt"
 )
@@ -42,22 +42,34 @@ MODEL_CONFIG_PATH = (
 
 
 def main() -> None:
+    if not CHECKPOINT_PATH.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {CHECKPOINT_PATH}"
+        )
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(f"\nDevice: {device}")
+
+    if device == "cuda":
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)}"
+        )
+
     prompt = input("\nPrompt: ").strip()
 
     if not prompt:
-        raise ValueError(
-            "Prompt must not be empty."
-        )
-
-    device = "cpu"
+        raise ValueError("Prompt must not be empty.")
 
     model_config = load_model_config(
         MODEL_CONFIG_PATH
     )
 
-    model = MujahidReasonerModel(
-        model_config
-    )
+    model = MujahidReasonerModel(model_config)
 
     checkpoint = torch.load(
         CHECKPOINT_PATH,
@@ -68,6 +80,9 @@ def main() -> None:
     model.load_state_dict(
         checkpoint["model_state_dict"]
     )
+
+    model = model.to(device)
+    model.eval()
 
     tokenizer = Tokenizer.from_file(
         str(TOKENIZER_PATH)
@@ -94,11 +109,7 @@ def main() -> None:
         config=generation_config,
         use_cache=True,
     ):
-        print(
-            chunk,
-            end="",
-            flush=True,
-        )
+        print(chunk, end="", flush=True)
 
     print("\n")
     print("=" * 60)

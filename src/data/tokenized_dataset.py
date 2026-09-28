@@ -13,15 +13,12 @@ class PackedTokenDataset(Dataset[tuple[Tensor, Tensor]]):
     """
     Memory-mapped dataset for packed causal-language-model training.
 
-    Each sample contains:
-
-        input : [t0, t1, t2, ..., t(n-1)]
-        target: [t1, t2, t3, ..., tn]
-
-    Tokens are stored in a binary file and accessed through a NumPy
-    memory map, so the complete token corpus does not need to reside
-    in RAM.
+    Tokens are stored as uint16 because the tokenizer vocabulary fits
+    within the uint16 range. The memory-mapped representation keeps the
+    complete corpus out of RAM.
     """
+
+    TOKEN_DTYPE = np.uint16
 
     def __init__(
         self,
@@ -42,19 +39,23 @@ class PackedTokenDataset(Dataset[tuple[Tensor, Tensor]]):
         self.sequence_length = sequence_length
 
         file_size = token_file.stat().st_size
+        dtype_size = np.dtype(
+            self.TOKEN_DTYPE
+        ).itemsize
 
         if file_size == 0:
             raise ValueError(
                 f"Token file is empty: {token_file}"
             )
 
-        if file_size % np.dtype(np.uint32).itemsize != 0:
+        if file_size % dtype_size != 0:
             raise ValueError(
-                "Token file size is not aligned to uint32."
+                "Token file size is not aligned to "
+                f"{self.TOKEN_DTYPE}."
             )
 
         self.total_tokens = (
-            file_size // np.dtype(np.uint32).itemsize
+            file_size // dtype_size
         )
 
         self.sequence_count = (
@@ -70,7 +71,7 @@ class PackedTokenDataset(Dataset[tuple[Tensor, Tensor]]):
 
         self.tokens = np.memmap(
             token_file,
-            dtype=np.uint32,
+            dtype=self.TOKEN_DTYPE,
             mode="r",
         )
 
@@ -120,7 +121,11 @@ class PackedTokenDataset(Dataset[tuple[Tensor, Tensor]]):
     def close(self) -> None:
         """Release the memory-mapped token file."""
 
-        mmap = getattr(self.tokens, "_mmap", None)
+        mmap = getattr(
+            self.tokens,
+            "_mmap",
+            None,
+        )
 
         if mmap is not None:
             mmap.close()
